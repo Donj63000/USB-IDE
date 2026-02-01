@@ -1,0 +1,4 @@
+﻿# Configuration Codex stockée sur la clé (mode fichier).
+cli_auth_credentials_store = "file"
+# Force le login via ChatGPT pour éviter les API keys involontaires.
+forced_login_method = "chatgpt"
