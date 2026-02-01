@@ -1,2 +1,0 @@
-# Dependances du projet client (exemple)
-textual[syntax]>=0.60
