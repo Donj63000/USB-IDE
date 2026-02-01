@@ -134,7 +134,13 @@ pub fn stream_subprocess(
 /// Construit argv pour executer une commande via cmd.exe sur Windows.
 pub fn windows_cmd_argv(command: &str) -> Vec<String> {
     let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-    vec![comspec, "/d".into(), "/s".into(), "/c".into(), command.to_string()]
+    vec![
+        comspec,
+        "/d".into(),
+        "/s".into(),
+        "/c".into(),
+        command.to_string(),
+    ]
 }
 
 /// Commande pour executer un script Python avec l'interpreteur courant (ou "python" par defaut).
@@ -142,7 +148,21 @@ pub fn python_run_argv(script: &Path) -> Vec<String> {
     let exe = std::env::var("USBIDE_PYTHON")
         .or_else(|_| std::env::var("PYTHON"))
         .unwrap_or_else(|_| "python".to_string());
-    vec![exe, script.to_string_lossy().to_string()]
+    vec![exe, path_for_cmd(script)]
+}
+
+fn path_for_cmd(path: &Path) -> String {
+    let raw = path.to_string_lossy().to_string();
+    if !cfg!(windows) {
+        return raw;
+    }
+    if let Some(stripped) = raw.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{}", stripped);
+    }
+    if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+        return stripped.to_string();
+    }
+    raw
 }
 
 #[cfg(test)]

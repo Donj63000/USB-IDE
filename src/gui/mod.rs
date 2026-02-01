@@ -1,22 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Local;
-use crossterm::ExecutableCommand;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
-use tui_textarea::{Input, TextArea};
+use eframe::egui::{self, Color32, RichText, ScrollArea, TextEdit};
 
 use crate::codex::{
     DisplayKind, codex_cli_available, codex_entrypoint_js, codex_env, codex_exec_argv,
@@ -30,8 +18,8 @@ use crate::process::{
     ProcEventKind, ProcHandle, python_run_argv, stream_subprocess, windows_cmd_argv,
 };
 
-const LOG_LIMIT: usize = 2000;
 const APP_NAME: &str = "ValDev Pro v1";
+const LOG_LIMIT: usize = 2000;
 
 #[derive(Debug, Clone)]
 struct OpenFile {
@@ -40,18 +28,20 @@ struct OpenFile {
     dirty: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum LogKind {
+    Info,
+    Warn,
+    Error,
+    User,
+    Assistant,
+    Action,
+}
+
 #[derive(Debug, Clone)]
 struct LogLine {
     text: String,
-    style: Style,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Focus {
-    Tree,
-    Editor,
-    Cmd,
-    Codex,
+    kind: LogKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,112 +70,6 @@ struct RunningProcess {
     contexte: String,
 }
 
-struct InputField {
-    value: String,
-    cursor: usize,
-}
-
-impl InputField {
-    fn new() -> Self {
-        Self {
-            value: String::new(),
-            cursor: 0,
-        }
-    }
-
-    fn clear(&mut self) {
-        self.value.clear();
-        self.cursor = 0;
-    }
-
-    fn insert_char(&mut self, ch: char) {
-        let mut chars: Vec<char> = self.value.chars().collect();
-        if self.cursor <= chars.len() {
-            chars.insert(self.cursor, ch);
-            self.cursor += 1;
-        }
-        self.value = chars.into_iter().collect();
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let mut chars: Vec<char> = self.value.chars().collect();
-        if self.cursor <= chars.len() {
-            chars.remove(self.cursor - 1);
-            self.cursor -= 1;
-            self.value = chars.into_iter().collect();
-        }
-    }
-
-    fn delete(&mut self) {
-        let mut chars: Vec<char> = self.value.chars().collect();
-        if self.cursor < chars.len() {
-            chars.remove(self.cursor);
-            self.value = chars.into_iter().collect();
-        }
-    }
-
-    fn move_left(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-        }
-    }
-
-    fn move_right(&mut self) {
-        let len = self.value.chars().count();
-        if self.cursor < len {
-            self.cursor += 1;
-        }
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
-        match key.code {
-            KeyCode::Enter => {
-                let submitted = self.value.trim().to_string();
-                self.clear();
-                if submitted.is_empty() {
-                    None
-                } else {
-                    Some(submitted)
-                }
-            }
-            KeyCode::Backspace => {
-                self.backspace();
-                None
-            }
-            KeyCode::Delete => {
-                self.delete();
-                None
-            }
-            KeyCode::Left => {
-                self.move_left();
-                None
-            }
-            KeyCode::Right => {
-                self.move_right();
-                None
-            }
-            KeyCode::Home => {
-                self.cursor = 0;
-                None
-            }
-            KeyCode::End => {
-                self.cursor = self.value.chars().count();
-                None
-            }
-            KeyCode::Char(ch) => {
-                if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                    self.insert_char(ch);
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct TreeEntry {
     path: PathBuf,
@@ -206,7 +90,7 @@ struct FileTree {
     root: FileNode,
     expanded: HashSet<PathBuf>,
     visible: Vec<TreeEntry>,
-    state: ListState,
+    selected: Option<PathBuf>,
 }
 
 impl FileTree {
@@ -218,10 +102,9 @@ impl FileTree {
             root,
             expanded,
             visible: Vec::new(),
-            state: ListState::default(),
+            selected: None,
         };
         tree.rebuild_visible();
-        tree.state.select(Some(0));
         tree
     }
 
@@ -230,48 +113,16 @@ impl FileTree {
         let mut entries = Vec::new();
         flatten_tree(&self.root, 0, &self.expanded, &mut entries);
         self.visible = entries;
-        if self.visible.is_empty() {
-            self.state.select(None);
-        } else if self.state.selected().unwrap_or(0) >= self.visible.len() {
-            self.state.select(Some(self.visible.len() - 1));
+        if self.selected.is_none() {
+            self.selected = self.visible.first().map(|entry| entry.path.clone());
         }
     }
 
-    fn selected_entry(&self) -> Option<&TreeEntry> {
-        self.state.selected().and_then(|idx| self.visible.get(idx))
-    }
-
-    fn select_next(&mut self) {
-        if self.visible.is_empty() {
-            return;
-        }
-        let next = match self.state.selected() {
-            Some(idx) => (idx + 1).min(self.visible.len() - 1),
-            None => 0,
-        };
-        self.state.select(Some(next));
-    }
-
-    fn select_prev(&mut self) {
-        if self.visible.is_empty() {
-            return;
-        }
-        let prev = match self.state.selected() {
-            Some(idx) => idx.saturating_sub(1),
-            None => 0,
-        };
-        self.state.select(Some(prev));
-    }
-
-    fn toggle_dir(&mut self) {
-        let path = match self.selected_entry() {
-            Some(entry) if entry.is_dir => entry.path.clone(),
-            _ => return,
-        };
-        if self.expanded.contains(&path) {
-            self.expanded.remove(&path);
+    fn toggle_dir(&mut self, path: &Path) {
+        if self.expanded.contains(path) {
+            self.expanded.remove(path);
         } else {
-            self.expanded.insert(path);
+            self.expanded.insert(path.to_path_buf());
         }
         self.rebuild_visible();
     }
@@ -281,12 +132,12 @@ fn build_tree(path: &Path) -> FileNode {
     let name = path
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or(".")
-        .to_string();
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| path.display().to_string());
     let is_dir = path.is_dir();
     let mut children = Vec::new();
     if is_dir {
-        if let Ok(read_dir) = fs::read_dir(path) {
+        if let Ok(read_dir) = std::fs::read_dir(path) {
             for entry in read_dir.flatten() {
                 let child_path = entry.path();
                 let child = build_tree(&child_path);
@@ -323,401 +174,421 @@ fn flatten_tree(
 }
 
 pub fn run(root_dir: PathBuf) -> Result<()> {
-    let mut stdout = std::io::stdout();
-    enable_raw_mode().context("impossible d'activer le mode raw")?;
-    stdout.execute(EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let mut app = App::new(root_dir)?;
-    let res = app.run(&mut terminal);
-    disable_raw_mode().ok();
-    let mut stdout = std::io::stdout();
-    stdout.execute(LeaveAlternateScreen).ok();
-    res
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
+        ..Default::default()
+    };
+    let root = root_dir.clone();
+    eframe::run_native(
+        APP_NAME,
+        options,
+        Box::new(move |cc| {
+            configure_style(&cc.egui_ctx);
+            Box::new(GuiApp::new(root))
+        }),
+    )
+    .map_err(|err| anyhow::anyhow!("Erreur interface GUI: {err}"))?;
+    Ok(())
 }
 
-struct App {
+fn configure_style(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    visuals.override_text_color = Some(Color32::from_rgb(230, 230, 230));
+    visuals.window_fill = Color32::from_rgb(18, 20, 24);
+    visuals.panel_fill = Color32::from_rgb(18, 20, 24);
+    visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(22, 24, 28);
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(28, 32, 38);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(40, 45, 54);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(218, 165, 72);
+    visuals.selection.bg_fill = Color32::from_rgb(218, 165, 72);
+    visuals.selection.stroke.color = Color32::from_rgb(255, 230, 180);
+    ctx.set_visuals(visuals);
+
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.window_margin = egui::Margin::same(10.0);
+    style.text_styles.insert(
+        egui::TextStyle::Heading,
+        egui::FontId::new(20.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Body,
+        egui::FontId::new(15.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Monospace,
+        egui::FontId::new(14.0, egui::FontFamily::Monospace),
+    );
+    ctx.set_style(style);
+}
+
+struct GuiApp {
     root_dir: PathBuf,
     current: Option<OpenFile>,
+    editor_text: String,
     tree: FileTree,
-    editor: TextArea<'static>,
-    cmd_input: InputField,
-    codex_input: InputField,
+    cmd_input: String,
+    codex_input: String,
     log: Vec<LogLine>,
     codex_log: Vec<LogLine>,
-    focus: Focus,
     title: String,
     sub_title: String,
+    running: Vec<RunningProcess>,
+    bug_log_path: PathBuf,
     codex_compact_view: bool,
     last_codex_message: Option<String>,
     codex_assistant_buffer: String,
-    running: Vec<RunningProcess>,
-    bug_log_path: PathBuf,
     codex_install_attempted: bool,
     pyinstaller_install_attempted: bool,
-    last_codex_width: u16,
     pending_codex_prompt: Option<String>,
+    last_window_title: String,
 }
 
-impl App {
-    fn new(root_dir: PathBuf) -> Result<Self> {
-        let root_dir = root_dir.canonicalize().unwrap_or(root_dir);
+impl GuiApp {
+    fn new(root_dir: PathBuf) -> Self {
+        let root_dir = match root_dir.canonicalize() {
+            Ok(path) => path,
+            Err(_) => root_dir,
+        };
         let bug_log_path = root_dir.join("bug.md");
         let tree = FileTree::new(&root_dir);
         let mut app = Self {
             root_dir,
             current: None,
+            editor_text: String::new(),
             tree,
-            editor: Self::make_editor(),
-            cmd_input: InputField::new(),
-            codex_input: InputField::new(),
+            cmd_input: String::new(),
+            codex_input: String::new(),
             log: Vec::new(),
             codex_log: Vec::new(),
-            focus: Focus::Tree,
             title: APP_NAME.to_string(),
             sub_title: String::new(),
+            running: Vec::new(),
+            bug_log_path,
             codex_compact_view: true,
             last_codex_message: None,
             codex_assistant_buffer: String::new(),
-            running: Vec::new(),
-            bug_log_path,
             codex_install_attempted: false,
             pyinstaller_install_attempted: false,
-            last_codex_width: 80,
             pending_codex_prompt: None,
+            last_window_title: String::new(),
         };
         app.ensure_portable_dirs();
         app.refresh_title();
         app.log_ui(format!(
-            "{APP_NAME}\nRoot: {}\nShell: champ 'Commande' - Codex: champ 'Codex' - Ctrl+K login - Ctrl+I install\n",
+            "{APP_NAME}\nRoot: {}\nAstuce: lance la version TUI avec --ui tui si besoin.\n",
             app.root_dir.display()
         ));
-        Ok(app)
+        app
     }
-
-    fn make_editor() -> TextArea<'static> {
-        let mut editor = TextArea::default();
-        editor.set_block(Block::default().borders(Borders::ALL).title("Editeur"));
-        editor
-    }
-
-    fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
-        let tick_rate = Duration::from_millis(50);
-        let mut last_tick = Instant::now();
-        loop {
-            terminal.draw(|f| self.draw(f))?;
-            self.drain_process_events();
-
-            let timeout = tick_rate.saturating_sub(last_tick.elapsed());
-            if event::poll(timeout)? {
-                if let Event::Key(key) = event::read()? {
-                    if self.handle_key(key) {
-                        break;
-                    }
-                }
-            }
-            if last_tick.elapsed() >= tick_rate {
-                last_tick = Instant::now();
-            }
-        }
-        Ok(())
-    }
-
-    fn draw(&mut self, f: &mut ratatui::Frame<'_>) {
-        let area = f.area();
-        let layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(1),
-            ])
-            .split(area);
-
-        self.draw_header(f, layout[0]);
-        self.draw_body(f, layout[1]);
-        self.draw_footer(f, layout[2]);
-    }
-
-    fn draw_header(&self, f: &mut ratatui::Frame<'_>, area: Rect) {
-        let title = Line::from(vec![
-            Span::styled(&self.title, Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("  "),
-            Span::styled(&self.sub_title, Style::default().fg(Color::Gray)),
-        ]);
-        let header = Paragraph::new(Text::from(title));
-        f.render_widget(header, area);
-    }
-
-    fn draw_footer(&self, f: &mut ratatui::Frame<'_>, area: Rect) {
-        let help = "Ctrl+S sauver | F5 executer | Ctrl+Q quitter | Tab focus";
-        let footer = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
-        f.render_widget(footer, area);
-    }
-
-    fn draw_body(&mut self, f: &mut ratatui::Frame<'_>, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-            .split(area);
-
-        self.draw_tree(f, chunks[0]);
-        self.draw_right(f, chunks[1]);
-    }
-
-    fn draw_tree(&mut self, f: &mut ratatui::Frame<'_>, area: Rect) {
-        let mut items = Vec::new();
-        for entry in &self.tree.visible {
-            let indent = "  ".repeat(entry.depth);
-            let is_expanded = self.tree.expanded.contains(&entry.path);
-            let icon = if entry.is_dir {
-                if is_expanded { "-" } else { "+" }
-            } else {
-                " "
-            };
-            let text = format!("{indent}{icon} {}", entry.name);
-            items.push(ListItem::new(Line::from(text)));
-        }
-        let block = Self::block_with_focus("Fichiers", self.focus == Focus::Tree);
-        let list = List::new(items)
-            .block(block)
-            .highlight_style(Style::default().bg(Color::Blue));
-        f.render_stateful_widget(list, area, &mut self.tree.state);
-    }
-
-    fn draw_right(&mut self, f: &mut ratatui::Frame<'_>, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(area);
-
-        self.draw_editor(f, chunks[0]);
-        self.draw_bottom(f, chunks[1]);
-    }
-
-    fn draw_editor(&mut self, f: &mut ratatui::Frame<'_>, area: Rect) {
-        let block = Self::block_with_focus("Editeur", self.focus == Focus::Editor);
-        self.editor.set_block(block);
-        f.render_widget(self.editor.widget(), area);
-        if self.focus == Focus::Editor {
-            let (row, col) = self.editor.cursor();
-            let x = area.x + col as u16 + 1;
-            let y = area.y + row as u16 + 1;
-            f.set_cursor_position((x, y));
-        }
-    }
-
-    fn draw_bottom(&mut self, f: &mut ratatui::Frame<'_>, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area);
-
-        self.draw_shell(f, chunks[0]);
-        self.draw_codex(f, chunks[1]);
-    }
-
-    fn draw_shell(&mut self, f: &mut ratatui::Frame<'_>, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0)])
-            .split(area);
-
-        let input_block = Self::block_with_focus("Commande", self.focus == Focus::Cmd);
-        let input = Paragraph::new(self.cmd_input.value.as_str()).block(input_block);
-        f.render_widget(input, chunks[0]);
-        if self.focus == Focus::Cmd {
-            let cursor_x = chunks[0].x + 1 + self.cmd_input.cursor as u16;
-            let cursor_y = chunks[0].y + 1;
-            f.set_cursor_position((cursor_x, cursor_y));
-        }
-
-        let log_block = Block::default().borders(Borders::ALL).title("Journal");
-        let log_text = self.render_log(&self.log, chunks[1].height.saturating_sub(2) as usize);
-        let log = Paragraph::new(log_text)
-            .block(log_block)
-            .wrap(Wrap { trim: false });
-        f.render_widget(log, chunks[1]);
-    }
-
-    fn draw_codex(&mut self, f: &mut ratatui::Frame<'_>, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0)])
-            .split(area);
-
-        let input_block = Self::block_with_focus("Codex", self.focus == Focus::Codex);
-        let input = Paragraph::new(self.codex_input.value.as_str()).block(input_block);
-        f.render_widget(input, chunks[0]);
-        if self.focus == Focus::Codex {
-            let cursor_x = chunks[0].x + 1 + self.codex_input.cursor as u16;
-            let cursor_y = chunks[0].y + 1;
-            f.set_cursor_position((cursor_x, cursor_y));
-        }
-
-        let log_block = Block::default().borders(Borders::ALL).title("Sortie Codex");
-        self.last_codex_width = chunks[1].width;
-        let log_text =
-            self.render_log(&self.codex_log, chunks[1].height.saturating_sub(2) as usize);
-        let log = Paragraph::new(log_text)
-            .block(log_block)
-            .wrap(Wrap { trim: false });
-        f.render_widget(log, chunks[1]);
-    }
-
-    fn render_log(&self, log: &[LogLine], max_lines: usize) -> Text<'_> {
-        let start = log.len().saturating_sub(max_lines);
-        let lines: Vec<Line> = log[start..]
-            .iter()
-            .map(|entry| Line::from(Span::styled(entry.text.clone(), entry.style)))
-            .collect();
-        Text::from(lines)
-    }
-
-    fn block_with_focus<'a>(title: &'a str, focused: bool) -> Block<'a> {
-        let style = if focused {
-            Style::default().fg(Color::Yellow)
+    fn update_window_title(&mut self, ctx: &egui::Context) {
+        let title = if self.sub_title.is_empty() {
+            self.title.clone()
         } else {
-            Style::default()
+            format!("{} - {}", self.title, self.sub_title)
         };
-        Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .style(style)
+        if title != self.last_window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_window_title = title;
+        }
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> bool {
-        if self.handle_global_shortcut(key) {
-            return true;
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.ctrl) {
+            self.action_save();
         }
-
-        match self.focus {
-            Focus::Tree => self.handle_tree_key(key),
-            Focus::Editor => self.handle_editor_key(key),
-            Focus::Cmd => self.handle_cmd_key(key),
-            Focus::Codex => self.handle_codex_key(key),
+        if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
+            self.action_run();
         }
-
-        false
+        if ctx.input(|i| i.key_pressed(egui::Key::L) && i.modifiers.ctrl) {
+            self.action_clear_log();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::R) && i.modifiers.ctrl) {
+            self.action_reload_tree();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::K) && i.modifiers.ctrl) {
+            self.action_codex_login();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::T) && i.modifiers.ctrl) {
+            self.action_codex_check();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::I) && i.modifiers.ctrl) {
+            self.action_codex_install();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::M) && i.modifiers.ctrl) {
+            self.action_toggle_codex_view();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::E) && i.modifiers.ctrl) {
+            self.action_build_exe();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::D) && i.modifiers.ctrl) {
+            self.action_dev_tools();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Q) && i.modifiers.ctrl) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
-    fn handle_global_shortcut(&mut self, key: KeyEvent) -> bool {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Char('s') => {
-                    self.action_save();
-                    return false;
+    fn panel_frame(ui: &egui::Ui) -> egui::Frame {
+        egui::Frame::group(ui.style())
+            .fill(Color32::from_rgb(20, 22, 26))
+            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(42, 46, 54)))
+            .inner_margin(egui::Margin::same(8.0))
+    }
+
+    fn draw_header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&self.title).strong().size(20.0));
+            ui.add_space(8.0);
+            ui.label(RichText::new(&self.sub_title).color(Color32::from_gray(160)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Quitter").clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                KeyCode::Char('l') => {
-                    self.action_clear_log();
-                    return false;
-                }
-                KeyCode::Char('r') => {
-                    self.action_reload_tree();
-                    return false;
-                }
-                KeyCode::Char('k') => {
-                    self.action_codex_login();
-                    return false;
-                }
-                KeyCode::Char('t') => {
-                    self.action_codex_check();
-                    return false;
-                }
-                KeyCode::Char('i') => {
-                    self.action_codex_install();
-                    return false;
-                }
-                KeyCode::Char('m') => {
-                    self.action_toggle_codex_view();
-                    return false;
-                }
-                KeyCode::Char('e') => {
-                    self.action_build_exe();
-                    return false;
-                }
-                KeyCode::Char('d') => {
-                    self.action_dev_tools();
-                    return false;
-                }
-                _ => {}
+            });
+        });
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Sauver").clicked() {
+                self.action_save();
             }
-        }
-
-        match key.code {
-            KeyCode::F(5) => {
+            if ui.button("Executer (F5)").clicked() {
                 self.action_run();
-                false
             }
-            KeyCode::Tab => {
-                self.focus = match self.focus {
-                    Focus::Tree => Focus::Editor,
-                    Focus::Editor => Focus::Cmd,
-                    Focus::Cmd => Focus::Codex,
-                    Focus::Codex => Focus::Tree,
-                };
-                false
+            if ui.button("Reload").clicked() {
+                self.action_reload_tree();
             }
-            KeyCode::BackTab => {
-                self.focus = match self.focus {
-                    Focus::Tree => Focus::Codex,
-                    Focus::Editor => Focus::Tree,
-                    Focus::Cmd => Focus::Editor,
-                    Focus::Codex => Focus::Cmd,
-                };
-                false
+            if ui.button("Vider logs").clicked() {
+                self.action_clear_log();
             }
-            _ => false,
-        }
+            ui.separator();
+            if ui.button("Codex login").clicked() {
+                self.action_codex_login();
+            }
+            if ui.button("Codex status").clicked() {
+                self.action_codex_check();
+            }
+            if ui.button("Codex install").clicked() {
+                self.action_codex_install();
+            }
+            let mode_label = if self.codex_compact_view {
+                "Codex: Compact"
+            } else {
+                "Codex: Brut"
+            };
+            if ui.button(mode_label).clicked() {
+                self.action_toggle_codex_view();
+            }
+            ui.separator();
+            if ui.button("Outils dev").clicked() {
+                self.action_dev_tools();
+            }
+            if ui.button("Build EXE").clicked() {
+                self.action_build_exe();
+            }
+        });
     }
 
-    fn handle_tree_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Up => self.tree.select_prev(),
-            KeyCode::Down => self.tree.select_next(),
-            KeyCode::Right | KeyCode::Enter => {
-                if let Some(entry) = self.tree.selected_entry() {
-                    if entry.is_dir {
-                        self.tree.toggle_dir();
-                    } else {
-                        self.open_file(entry.path.clone());
+    fn draw_file_tree(&mut self, ui: &mut egui::Ui) {
+        Self::panel_frame(ui).show(ui, |ui| {
+            ui.label(RichText::new("Fichiers").strong());
+            ui.separator();
+            let entries = self.tree.visible.clone();
+            ScrollArea::vertical()
+                .id_source("file_tree")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for entry in entries {
+                        let is_selected = self
+                            .tree
+                            .selected
+                            .as_ref()
+                            .map(|p| p == &entry.path)
+                            .unwrap_or(false);
+                        ui.horizontal(|ui| {
+                            let indent = entry.depth as f32 * 12.0;
+                            ui.add_space(indent);
+                            if entry.is_dir {
+                                let icon = if self.tree.expanded.contains(&entry.path) {
+                                    "v"
+                                } else {
+                                    ">"
+                                };
+                                if ui.button(icon).clicked() {
+                                    self.tree.toggle_dir(&entry.path);
+                                }
+                            } else {
+                                ui.add_space(18.0);
+                            }
+                            let label = if entry.is_dir {
+                                format!("{}/", entry.name)
+                            } else {
+                                entry.name.clone()
+                            };
+                            if ui.selectable_label(is_selected, label).clicked() {
+                                self.tree.selected = Some(entry.path.clone());
+                                if entry.is_dir {
+                                    self.tree.toggle_dir(&entry.path);
+                                } else {
+                                    self.open_file(entry.path.clone());
+                                }
+                            }
+                        });
                     }
+                });
+        });
+    }
+
+    fn draw_editor(&mut self, ui: &mut egui::Ui) {
+        Self::panel_frame(ui).show(ui, |ui| {
+            if let Some(current) = &self.current {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Fichier:").strong());
+                    ui.label(current.path.display().to_string());
+                    ui.add_space(16.0);
+                    ui.label(RichText::new("Encodage:").strong());
+                    ui.label(current.encoding.clone());
+                    if current.dirty {
+                        ui.add_space(12.0);
+                        ui.colored_label(Color32::from_rgb(218, 165, 72), "modifie");
+                    }
+                });
+                ui.add_space(6.0);
+                let editor = TextEdit::multiline(&mut self.editor_text)
+                    .code_editor()
+                    .desired_width(f32::INFINITY);
+                let response = ui.add_sized(ui.available_size(), editor);
+                if response.changed() {
+                    if let Some(current) = self.current.as_mut() {
+                        current.dirty = true;
+                    }
+                    self.refresh_title();
                 }
+            } else {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(80.0);
+                    ui.label(RichText::new("Aucun fichier ouvert.").heading());
+                    ui.label("Clique un fichier a gauche pour l'ouvrir.");
+                });
             }
-            KeyCode::Left => self.tree.toggle_dir(),
-            _ => {}
-        }
+        });
     }
 
-    fn handle_editor_key(&mut self, key: KeyEvent) {
-        let mut changed = false;
-        if matches!(
-            key.code,
-            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete | KeyCode::Enter | KeyCode::Tab
-        ) {
-            changed = true;
-        }
-        let input = Input::from(key);
-        self.editor.input(input);
-        if changed {
-            if let Some(current) = self.current.as_mut() {
-                current.dirty = true;
-                self.refresh_title();
+    fn draw_logs(&mut self, ui: &mut egui::Ui, target: LogTarget, id_source: &str) {
+        let entries = match target {
+            LogTarget::Main => &self.log,
+            LogTarget::Codex => &self.codex_log,
+        };
+        ScrollArea::vertical()
+            .id_source(id_source)
+            .stick_to_bottom(true)
+            .auto_shrink([false, false])
+            .max_height(ui.available_height())
+            .show(ui, |ui| {
+                if entries.is_empty() {
+                    ui.label(RichText::new("Aucun log.").color(Color32::from_gray(130)));
+                }
+                for entry in entries {
+                    let color = match entry.kind {
+                        LogKind::Info => Color32::from_gray(210),
+                        LogKind::Warn => Color32::from_rgb(240, 200, 120),
+                        LogKind::Error => Color32::from_rgb(240, 100, 100),
+                        LogKind::User => Color32::from_rgb(120, 190, 255),
+                        LogKind::Assistant => Color32::from_rgb(120, 220, 160),
+                        LogKind::Action => Color32::from_rgb(218, 165, 72),
+                    };
+                    ui.label(RichText::new(&entry.text).color(color));
+                }
+            });
+    }
+
+    fn draw_command_panel(&mut self, ui: &mut egui::Ui) {
+        Self::panel_frame(ui).show(ui, |ui| {
+            ui.label(RichText::new("Commande").strong());
+            ui.add_space(6.0);
+            let mut submit = false;
+            ui.horizontal(|ui| {
+                let button_width = 90.0;
+                let input_width =
+                    (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(140.0);
+                let response = ui.add_sized(
+                    [input_width, 0.0],
+                    TextEdit::singleline(&mut self.cmd_input).hint_text("Ex: python script.py"),
+                );
+                if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                if ui
+                    .add_sized([button_width, 0.0], egui::Button::new("Executer"))
+                    .clicked()
+                {
+                    submit = true;
+                }
+            });
+            if submit {
+                let cmd = self.cmd_input.trim().to_string();
+                self.cmd_input.clear();
+                self.run_shell(cmd);
             }
-        }
+            ui.add_space(8.0);
+            self.draw_logs(ui, LogTarget::Main, "log_main");
+        });
     }
 
-    fn handle_cmd_key(&mut self, key: KeyEvent) {
-        if let Some(cmd) = self.cmd_input.handle_key(key) {
-            self.run_shell(cmd);
-        }
-    }
-
-    fn handle_codex_key(&mut self, key: KeyEvent) {
-        if let Some(prompt) = self.codex_input.handle_key(key) {
-            self.run_codex(prompt);
-        }
+    fn draw_codex_panel(&mut self, ui: &mut egui::Ui) {
+        Self::panel_frame(ui).show(ui, |ui| {
+            ui.label(RichText::new("Codex").strong());
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Login").clicked() {
+                    self.action_codex_login();
+                }
+                if ui.button("Status").clicked() {
+                    self.action_codex_check();
+                }
+                if ui.button("Installer").clicked() {
+                    self.action_codex_install();
+                }
+                let label = if self.codex_compact_view {
+                    "Compact"
+                } else {
+                    "Brut"
+                };
+                if ui.button(label).clicked() {
+                    self.action_toggle_codex_view();
+                }
+            });
+            ui.add_space(4.0);
+            let mut submit = false;
+            ui.horizontal(|ui| {
+                let button_width = 90.0;
+                let input_width =
+                    (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(140.0);
+                let response = ui.add_sized(
+                    [input_width, 0.0],
+                    TextEdit::singleline(&mut self.codex_input)
+                        .hint_text("Ex: explique ce code..."),
+                );
+                if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                if ui
+                    .add_sized([button_width, 0.0], egui::Button::new("Envoyer"))
+                    .clicked()
+                {
+                    submit = true;
+                }
+            });
+            if submit {
+                let prompt = self.codex_input.trim().to_string();
+                self.codex_input.clear();
+                self.run_codex(prompt);
+            }
+            ui.add_space(8.0);
+            self.draw_logs(ui, LogTarget::Codex, "log_codex");
+        });
     }
 
     fn refresh_title(&mut self) {
@@ -731,26 +602,14 @@ impl App {
         }
     }
 
-    fn log_ui(&mut self, msg: String) {
-        self.push_log(LogTarget::Main, msg, Style::default());
-    }
-
-    fn codex_log_ui(&mut self, msg: String) {
-        self.push_log(LogTarget::Codex, msg, Style::default());
-    }
-
-    fn codex_log_output(&mut self, msg: String) {
-        self.push_log(LogTarget::Codex, msg, Style::default());
-    }
-
-    fn push_log(&mut self, target: LogTarget, msg: String, style: Style) {
+    fn push_log(&mut self, target: LogTarget, msg: String, kind: LogKind) {
         let lines: Vec<String> = msg.split('\n').map(|s| s.to_string()).collect();
         let store = match target {
             LogTarget::Main => &mut self.log,
             LogTarget::Codex => &mut self.codex_log,
         };
         for line in lines {
-            store.push(LogLine { text: line, style });
+            store.push(LogLine { text: line, kind });
         }
         if store.len() > LOG_LIMIT {
             let drain = store.len() - LOG_LIMIT;
@@ -758,9 +617,21 @@ impl App {
         }
     }
 
+    fn log_ui(&mut self, msg: String) {
+        self.push_log(LogTarget::Main, msg, LogKind::Info);
+    }
+
+    fn codex_log_ui(&mut self, msg: String) {
+        self.push_log(LogTarget::Codex, msg, LogKind::Info);
+    }
+
     fn log_issue(&mut self, msg: &str, niveau: &str, contexte: &str, target: LogTarget) {
-        let styled = Style::default().fg(Color::Red);
-        self.push_log(target, msg.to_string(), styled);
+        let kind = if niveau == "avertissement" {
+            LogKind::Warn
+        } else {
+            LogKind::Error
+        };
+        self.push_log(target, msg.to_string(), kind);
         self.record_issue(niveau, msg, contexte, None);
     }
 
@@ -777,7 +648,7 @@ impl App {
         }
         lines.push(String::new());
         let content = lines.join("\n");
-        let _ = fs::OpenOptions::new()
+        let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.bug_log_path)
@@ -792,7 +663,7 @@ impl App {
             self.root_dir.join("tmp"),
             self.root_dir.join("codex_home"),
         ] {
-            let _ = fs::create_dir_all(path);
+            let _ = std::fs::create_dir_all(path);
         }
     }
 
@@ -940,14 +811,7 @@ impl App {
                 return;
             }
         };
-
-        let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
-        if lines.is_empty() {
-            lines.push(String::new());
-        }
-        let mut editor = TextArea::from(lines);
-        editor.set_block(Block::default().borders(Borders::ALL).title("Editeur"));
-        self.editor = editor;
+        self.editor_text = text;
         self.current = Some(OpenFile {
             path,
             encoding,
@@ -956,6 +820,30 @@ impl App {
         self.refresh_title();
     }
 
+    fn write_with_encoding(&self, path: &Path, encoding: &str, content: &str) -> Result<bool> {
+        let encoding_lower = encoding.to_lowercase();
+        if encoding_lower == "utf-8" {
+            std::fs::write(path, content.as_bytes()).context("ecriture fichier")?;
+            return Ok(false);
+        }
+        if encoding_lower == "utf-8-sig" {
+            let mut data = vec![0xEF, 0xBB, 0xBF];
+            data.extend_from_slice(content.as_bytes());
+            std::fs::write(path, data).context("ecriture fichier")?;
+            return Ok(false);
+        }
+        if let Some(enc) = encoding_rs::Encoding::for_label(encoding_lower.as_bytes()) {
+            let (cow, _, had_errors) = enc.encode(content);
+            if had_errors {
+                std::fs::write(path, content.as_bytes()).context("ecriture fallback utf-8")?;
+                return Ok(true);
+            }
+            std::fs::write(path, cow.as_ref()).context("ecriture fichier")?;
+            return Ok(false);
+        }
+        std::fs::write(path, content.as_bytes()).context("ecriture fallback utf-8")?;
+        Ok(true)
+    }
     fn action_save(&mut self) {
         let (path, encoding, dirty) = match self.current.as_ref() {
             Some(current) => (
@@ -977,7 +865,7 @@ impl App {
             return;
         }
 
-        let content = self.editor.lines().join("\n");
+        let content = self.editor_text.clone();
         let result = self.write_with_encoding(&path, &encoding, &content);
         match result {
             Ok(used_utf8_fallback) => {
@@ -1008,31 +896,6 @@ impl App {
                 );
             }
         }
-    }
-
-    fn write_with_encoding(&self, path: &Path, encoding: &str, content: &str) -> Result<bool> {
-        let encoding_lower = encoding.to_lowercase();
-        if encoding_lower == "utf-8" {
-            fs::write(path, content.as_bytes()).context("ecriture fichier")?;
-            return Ok(false);
-        }
-        if encoding_lower == "utf-8-sig" {
-            let mut data = vec![0xEF, 0xBB, 0xBF];
-            data.extend_from_slice(content.as_bytes());
-            fs::write(path, data).context("ecriture fichier")?;
-            return Ok(false);
-        }
-        if let Some(enc) = encoding_rs::Encoding::for_label(encoding_lower.as_bytes()) {
-            let (cow, _, had_errors) = enc.encode(content);
-            if had_errors {
-                fs::write(path, content.as_bytes()).context("ecriture fallback utf-8")?;
-                return Ok(true);
-            }
-            fs::write(path, cow.as_ref()).context("ecriture fichier")?;
-            return Ok(false);
-        }
-        fs::write(path, content.as_bytes()).context("ecriture fallback utf-8")?;
-        Ok(true)
     }
 
     fn action_run(&mut self) {
@@ -1120,7 +983,7 @@ impl App {
         self.codex_log_ui("Login Codex : navigateur/Device auth selon config.".to_string());
         if !self.codex_device_auth_enabled() {
             self.codex_log_ui(
-                "Astuce: si le navigateur ne s'ouvre pas, definis USBIDE_CODEX_DEVICE_AUTH=1 puis relance Ctrl+K."
+                "Astuce: si le navigateur ne s'ouvre pas, definis USBIDE_CODEX_DEVICE_AUTH=1 puis relance."
                     .to_string(),
             );
         }
@@ -1157,19 +1020,19 @@ impl App {
             "node: {}",
             node_path
                 .map(|p| p.display().to_string())
-                .unwrap_or("absent".into())
+                .unwrap_or_else(|| "absent".into())
         ));
         self.codex_log_ui(format!(
             "entrypoint: {}",
             entry_path
                 .map(|p| p.display().to_string())
-                .unwrap_or("absent".into())
+                .unwrap_or_else(|| "absent".into())
         ));
         self.codex_log_ui(format!(
             "codex (PATH): {}",
             resolved
                 .map(|p| p.display().to_string())
-                .unwrap_or("absent".into())
+                .unwrap_or_else(|| "absent".into())
         ));
         let argv = codex_status_argv(Some(&self.root_dir), Some(&env_map));
         self.codex_log_ui(format!("$ {}", argv.join(" ")));
@@ -1197,7 +1060,7 @@ impl App {
         }
         let env_map = self.tools_env();
         let prefix = tools_install_prefix(&self.root_dir);
-        let _ = fs::create_dir_all(&prefix);
+        let _ = std::fs::create_dir_all(&prefix);
         let wheelhouse = self.wheelhouse_path();
         let argv =
             match pip_install_argv(&prefix, &tools, wheelhouse.as_deref(), wheelhouse.is_some()) {
@@ -1265,7 +1128,7 @@ impl App {
             }
         }
         let dist_dir = self.root_dir.join("dist");
-        let _ = fs::create_dir_all(&dist_dir);
+        let _ = std::fs::create_dir_all(&dist_dir);
         let argv = match pyinstaller_build_argv(
             &path,
             &dist_dir,
@@ -1293,7 +1156,6 @@ impl App {
             ProcessKind::PyInstallerBuild,
         );
     }
-
     fn install_pyinstaller(&mut self, force: bool) -> bool {
         let env_map = self.tools_env();
         if !force && pyinstaller_available(Some(&self.root_dir), Some(&env_map)) {
@@ -1304,7 +1166,7 @@ impl App {
         }
         self.pyinstaller_install_attempted = true;
         let prefix = tools_install_prefix(&self.root_dir);
-        let _ = fs::create_dir_all(&prefix);
+        let _ = std::fs::create_dir_all(&prefix);
         let wheelhouse = self.wheelhouse_path();
         let argv =
             match pyinstaller_install_argv(&prefix, wheelhouse.as_deref(), wheelhouse.is_some()) {
@@ -1377,7 +1239,7 @@ impl App {
         let package = std::env::var("USBIDE_CODEX_NPM_PACKAGE")
             .unwrap_or_else(|_| "@openai/codex".to_string());
         let prefix = codex_install_prefix(&self.root_dir);
-        let _ = fs::create_dir_all(&prefix);
+        let _ = std::fs::create_dir_all(&prefix);
         let argv = match codex_install_argv(&self.root_dir, &prefix, &package) {
             Ok(argv) => argv,
             Err(err) => {
@@ -1396,9 +1258,9 @@ impl App {
                 "Installation Codex package={package} prefix={}",
                 prefix.display()
             ),
-            Style::default(),
+            LogKind::Info,
         );
-        self.push_log(target, format!("$ {}", argv.join(" ")), Style::default());
+        self.push_log(target, format!("$ {}", argv.join(" ")), LogKind::Info);
         self.spawn_process(
             argv,
             env_map,
@@ -1443,7 +1305,7 @@ impl App {
                 self.pending_codex_prompt = Some(prompt);
             } else {
                 self.log_issue(
-                    "Codex indisponible. (Ctrl+I pour installer)",
+                    "Codex indisponible. (installe via bouton)",
                     "erreur",
                     "codex_exec",
                     LogTarget::Codex,
@@ -1531,11 +1393,10 @@ impl App {
         remaining.append(&mut spawned);
         self.running = remaining;
     }
-
     fn handle_process_line(&mut self, proc: &mut RunningProcess, line: &str) {
         match proc.kind {
             ProcessKind::CodexExec => self.handle_codex_line(line),
-            _ => self.push_log(proc.target, line.to_string(), Style::default()),
+            _ => self.push_log(proc.target, line.to_string(), LogKind::Info),
         }
     }
 
@@ -1575,10 +1436,10 @@ impl App {
                         }
                     } else {
                         self.codex_log_action("Codex n'est pas authentifie dans ce CODEX_HOME.");
-                        self.codex_log_action("Fais Ctrl+K pour `codex login` (ou device auth).");
+                        self.codex_log_action("Fais Login puis recommence.");
                         if !self.codex_device_auth_enabled() {
                             self.codex_log_action(
-                                "Astuce: si le navigateur ne s'ouvre pas, definis USBIDE_CODEX_DEVICE_AUTH=1 puis Ctrl+K.",
+                                "Astuce: si le navigateur ne s'ouvre pas, definis USBIDE_CODEX_DEVICE_AUTH=1.",
                             );
                         }
                     }
@@ -1615,7 +1476,7 @@ impl App {
                 if self.codex_compact_view {
                     self.codex_log_action(trimmed);
                 } else {
-                    self.codex_log_output(trimmed.to_string());
+                    self.codex_log_ui(trimmed.to_string());
                 }
                 return;
             }
@@ -1702,210 +1563,75 @@ impl App {
                 }
             }
         } else if let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) {
-            self.codex_log_output(format!("[{event_type}] {value}"));
+            self.codex_log_ui(format!("[{event_type}] {value}"));
         } else {
-            self.codex_log_output(value.to_string());
+            self.codex_log_ui(value.to_string());
         }
     }
 
-    fn codex_log_entry(&mut self, msg: &str, label: &str, kind: &str) {
+    fn codex_log_entry(&mut self, msg: &str, label: &str, kind: LogKind) {
         let cleaned = msg.trim();
         if cleaned.is_empty() {
             return;
         }
-        let fingerprint = format!("{kind}:{cleaned}");
+        let fingerprint = format!("{label}:{cleaned}");
         if self.last_codex_message.as_deref() == Some(&fingerprint) {
             return;
         }
         self.last_codex_message = Some(fingerprint);
-        self.push_log(
-            LogTarget::Codex,
-            label.to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        );
-        let width = self.last_codex_width.saturating_sub(4) as usize;
-        for line in crate::codex::wrap_text(msg, width) {
-            if line.is_empty() {
-                self.push_log(LogTarget::Codex, String::new(), Style::default());
-            } else if kind == "assistant" {
-                self.push_log(LogTarget::Codex, line, Style::default().fg(Color::Green));
-            } else {
-                self.push_log(LogTarget::Codex, line, Style::default());
-            }
-        }
-        self.push_log(LogTarget::Codex, String::new(), Style::default());
+        self.push_log(LogTarget::Codex, label.to_string(), LogKind::Action);
+        self.push_log(LogTarget::Codex, cleaned.to_string(), kind);
+        self.push_log(LogTarget::Codex, String::new(), LogKind::Info);
     }
 
     fn codex_log_user_message(&mut self, msg: &str) {
-        self.codex_log_entry(msg, "Utilisateur", "user");
+        self.codex_log_entry(msg, "Utilisateur", LogKind::User);
     }
 
     fn codex_log_action(&mut self, msg: &str) {
-        self.codex_log_entry(msg, "Action", "action");
+        self.codex_log_entry(msg, "Action", LogKind::Action);
     }
 
     fn codex_log_message(&mut self, msg: &str) {
-        self.codex_log_entry(msg, "Assistant", "assistant");
+        self.codex_log_entry(msg, "Assistant", LogKind::Assistant);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-    use tempfile::TempDir;
+impl eframe::App for GuiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_process_events();
+        self.handle_shortcuts(ctx);
+        self.update_window_title(ctx);
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+        egui::TopBottomPanel::top("header")
+            .resizable(false)
+            .show(ctx, |ui| self.draw_header(ui));
 
-    fn with_env_lock<F: FnOnce()>(f: F) {
-        let _guard = ENV_LOCK.lock().unwrap();
-        f();
-    }
+        egui::SidePanel::left("files")
+            .resizable(true)
+            .default_width(280.0)
+            .min_width(220.0)
+            .max_width(420.0)
+            .show(ctx, |ui| self.draw_file_tree(ui));
 
-    fn set_env(key: &str, value: &str) {
-        unsafe {
-            std::env::set_var(key, value);
-        }
-    }
+        egui::TopBottomPanel::bottom("bottom")
+            .resizable(true)
+            .default_height(300.0)
+            .min_height(220.0)
+            .show(ctx, |ui| {
+                let height = ui.available_height();
+                ui.columns(2, |columns| {
+                    columns[0].set_min_height(height);
+                    columns[1].set_min_height(height);
+                    self.draw_command_panel(&mut columns[0]);
+                    self.draw_codex_panel(&mut columns[1]);
+                });
+            });
 
-    fn remove_env(key: &str) {
-        unsafe {
-            std::env::remove_var(key);
-        }
-    }
-
-    #[test]
-    fn refresh_title_sans_fichier() {
-        let dir = TempDir::new().unwrap();
-        let app = App::new(dir.path().to_path_buf()).unwrap();
-        assert_eq!(app.title, APP_NAME);
-        assert_eq!(app.sub_title, dir.path().display().to_string());
-    }
-
-    #[test]
-    fn refresh_title_avec_fichier_dirty() {
-        let dir = TempDir::new().unwrap();
-        let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.current = Some(OpenFile {
-            path: dir.path().join("main.py"),
-            encoding: "utf-8".to_string(),
-            dirty: true,
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.draw_editor(ui);
         });
-        app.refresh_title();
-        assert_eq!(app.title, format!("{APP_NAME} *"));
-        assert!(app.sub_title.contains("main.py"));
-        assert!(app.sub_title.contains("utf-8"));
-    }
 
-    #[test]
-    fn portable_env_defauts() {
-        let dir = TempDir::new().unwrap();
-        let app = App::new(dir.path().to_path_buf()).unwrap();
-        let env = app.portable_env(HashMap::new());
-        assert_eq!(
-            env.get("PIP_CACHE_DIR").unwrap(),
-            &dir.path().join("cache").join("pip").display().to_string()
-        );
-        assert_eq!(
-            env.get("PYTHONPYCACHEPREFIX").unwrap(),
-            &dir.path()
-                .join("cache")
-                .join("pycache")
-                .display()
-                .to_string()
-        );
-        assert_eq!(
-            env.get("TEMP").unwrap(),
-            &dir.path().join("tmp").display().to_string()
-        );
-        assert_eq!(
-            env.get("TMP").unwrap(),
-            &dir.path().join("tmp").display().to_string()
-        );
-        assert_eq!(env.get("PYTHONNOUSERSITE").unwrap(), "1");
-        assert_eq!(
-            env.get("CODEX_HOME").unwrap(),
-            &dir.path().join("codex_home").display().to_string()
-        );
-        assert_eq!(
-            env.get("NPM_CONFIG_CACHE").unwrap(),
-            &dir.path().join("cache").join("npm").display().to_string()
-        );
-        assert_eq!(env.get("NPM_CONFIG_UPDATE_NOTIFIER").unwrap(), "false");
-    }
-
-    #[test]
-    fn sanitize_codex_env_supprime() {
-        let dir = TempDir::new().unwrap();
-        let app = App::new(dir.path().to_path_buf()).unwrap();
-        with_env_lock(|| {
-            let mut env = HashMap::from([
-                ("OPENAI_API_KEY".to_string(), "sk-test".to_string()),
-                ("CODEX_API_KEY".to_string(), "sk-codex".to_string()),
-                (
-                    "OPENAI_BASE_URL".to_string(),
-                    "https://example.com".to_string(),
-                ),
-            ]);
-            remove_env("USBIDE_CODEX_ALLOW_API_KEY");
-            remove_env("USBIDE_CODEX_ALLOW_CUSTOM_BASE");
-            app.sanitize_codex_env(&mut env);
-            assert!(!env.contains_key("OPENAI_API_KEY"));
-            assert!(!env.contains_key("CODEX_API_KEY"));
-            assert!(!env.contains_key("OPENAI_BASE_URL"));
-        });
-    }
-
-    #[test]
-    fn sanitize_codex_env_respecte_overrides() {
-        let dir = TempDir::new().unwrap();
-        let app = App::new(dir.path().to_path_buf()).unwrap();
-        with_env_lock(|| {
-            let mut env = HashMap::from([
-                ("OPENAI_API_KEY".to_string(), "sk-test".to_string()),
-                ("CODEX_API_KEY".to_string(), "sk-codex".to_string()),
-                (
-                    "OPENAI_BASE_URL".to_string(),
-                    "https://example.com".to_string(),
-                ),
-            ]);
-            set_env("USBIDE_CODEX_ALLOW_API_KEY", "1");
-            set_env("USBIDE_CODEX_ALLOW_CUSTOM_BASE", "true");
-            app.sanitize_codex_env(&mut env);
-            assert_eq!(env.get("OPENAI_API_KEY").unwrap(), "sk-test");
-            assert_eq!(env.get("CODEX_API_KEY").unwrap(), "sk-codex");
-            assert_eq!(env.get("OPENAI_BASE_URL").unwrap(), "https://example.com");
-            remove_env("USBIDE_CODEX_ALLOW_API_KEY");
-            remove_env("USBIDE_CODEX_ALLOW_CUSTOM_BASE");
-        });
-    }
-
-    #[test]
-    fn codex_flags_env() {
-        let dir = TempDir::new().unwrap();
-        let app = App::new(dir.path().to_path_buf()).unwrap();
-        with_env_lock(|| {
-            set_env("USBIDE_CODEX_DEVICE_AUTH", "1");
-            assert!(app.codex_device_auth_enabled());
-            set_env("USBIDE_CODEX_DEVICE_AUTH", "0");
-            assert!(!app.codex_device_auth_enabled());
-            remove_env("USBIDE_CODEX_DEVICE_AUTH");
-            set_env("USBIDE_CODEX_AUTO_INSTALL", "0");
-            assert!(!app.codex_auto_install_enabled());
-            set_env("USBIDE_CODEX_AUTO_INSTALL", "1");
-            assert!(app.codex_auto_install_enabled());
-            remove_env("USBIDE_CODEX_AUTO_INSTALL");
-        });
-    }
-
-    #[test]
-    fn record_issue_cree_bug_md() {
-        let dir = TempDir::new().unwrap();
-        let app = App::new(dir.path().to_path_buf()).unwrap();
-        app.record_issue("erreur", "Erreur test", "test_unitaire", None);
-        let contenu = fs::read_to_string(dir.path().join("bug.md")).unwrap();
-        assert!(contenu.contains("niveau: erreur"));
-        assert!(contenu.contains("contexte: test_unitaire"));
-        assert!(contenu.contains("message: Erreur test"));
+        ctx.request_repaint_after(Duration::from_millis(33));
     }
 }

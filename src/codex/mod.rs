@@ -28,6 +28,20 @@ fn is_windows() -> bool {
     cfg!(windows)
 }
 
+fn path_for_cmd(path: &Path) -> String {
+    let raw = path.to_string_lossy().to_string();
+    if !is_windows() {
+        return raw;
+    }
+    if let Some(stripped) = raw.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{}", stripped);
+    }
+    if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+        return stripped.to_string();
+    }
+    raw
+}
+
 fn find_in_path(cmd: &str, path: Option<&str>, is_windows: bool) -> Option<PathBuf> {
     let cmd = cmd.trim();
     if cmd.is_empty() {
@@ -35,7 +49,8 @@ fn find_in_path(cmd: &str, path: Option<&str>, is_windows: bool) -> Option<PathB
     }
 
     let candidate = Path::new(cmd);
-    let has_separator = cmd.contains(std::path::MAIN_SEPARATOR) || (is_windows && cmd.contains('/'));
+    let has_separator =
+        cmd.contains(std::path::MAIN_SEPARATOR) || (is_windows && cmd.contains('/'));
     if candidate.is_absolute() || has_separator {
         return if candidate.exists() {
             Some(candidate.to_path_buf())
@@ -49,7 +64,8 @@ fn find_in_path(cmd: &str, path: Option<&str>, is_windows: bool) -> Option<PathB
 
     let mut extensions: Vec<String> = Vec::new();
     if is_windows && candidate.extension().is_none() {
-        let pathext = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD;.PS1".to_string());
+        let pathext =
+            env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD;.PS1".to_string());
         extensions = pathext
             .split(';')
             .filter(|ext| !ext.is_empty())
@@ -99,7 +115,10 @@ pub fn python_scripts_dir(prefix: &Path) -> PathBuf {
     }
 }
 
-pub fn tools_env(root_dir: &Path, base_env: Option<&HashMap<String, String>>) -> HashMap<String, String> {
+pub fn tools_env(
+    root_dir: &Path,
+    base_env: Option<&HashMap<String, String>>,
+) -> HashMap<String, String> {
     let mut env_map = base_env.cloned().unwrap_or_else(|| env::vars().collect());
     let bin_dir = python_scripts_dir(&tools_install_prefix(root_dir));
     prepend_path(&mut env_map, &bin_dir);
@@ -136,7 +155,10 @@ pub fn tool_available(
     Ok(find_in_path(tool, path_value, is_windows()).is_some())
 }
 
-pub fn pyinstaller_available(root_dir: Option<&Path>, env: Option<&HashMap<String, String>>) -> bool {
+pub fn pyinstaller_available(
+    root_dir: Option<&Path>,
+    env: Option<&HashMap<String, String>>,
+) -> bool {
     tool_available("pyinstaller", root_dir, env).unwrap_or(false)
 }
 
@@ -146,7 +168,11 @@ pub fn pip_install_argv(
     find_links: Option<&Path>,
     no_index: bool,
 ) -> Result<Vec<String>, CodexError> {
-    let cleaned: Vec<String> = packages.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let cleaned: Vec<String> = packages
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     if cleaned.is_empty() {
         return Err(CodexError::EmptyPackages);
     }
@@ -157,14 +183,14 @@ pub fn pip_install_argv(
         "install".to_string(),
         "--upgrade".to_string(),
         "--prefix".to_string(),
-        prefix.to_string_lossy().to_string(),
+        path_for_cmd(prefix),
     ];
     if no_index {
         argv.push("--no-index".to_string());
     }
     if let Some(links) = find_links {
         argv.push("--find-links".to_string());
-        argv.push(links.to_string_lossy().to_string());
+        argv.push(path_for_cmd(links));
     }
     argv.extend(cleaned);
     Ok(argv)
@@ -194,7 +220,7 @@ pub fn pyinstaller_build_argv(
         "--noconfirm".to_string(),
         "--onedir".to_string(),
         "--distpath".to_string(),
-        dist_dir.to_string_lossy().to_string(),
+        path_for_cmd(dist_dir),
     ];
     if onefile {
         argv.retain(|arg| arg != "--onedir");
@@ -202,13 +228,13 @@ pub fn pyinstaller_build_argv(
     }
     if let Some(work) = work_dir {
         argv.push("--workpath".to_string());
-        argv.push(work.to_string_lossy().to_string());
+        argv.push(path_for_cmd(work));
     }
     if let Some(spec) = spec_dir {
         argv.push("--specpath".to_string());
-        argv.push(spec.to_string_lossy().to_string());
+        argv.push(path_for_cmd(spec));
     }
-    argv.push(script.to_string_lossy().to_string());
+    argv.push(path_for_cmd(script));
     Ok(argv)
 }
 
@@ -228,7 +254,10 @@ pub fn node_tools_dir(root_dir: &Path) -> PathBuf {
     root_dir.join("tools").join("node")
 }
 
-pub fn node_executable(root_dir: &Path, env_map: Option<&HashMap<String, String>>) -> Option<PathBuf> {
+pub fn node_executable(
+    root_dir: &Path,
+    env_map: Option<&HashMap<String, String>>,
+) -> Option<PathBuf> {
     node_executable_with_os(root_dir, env_map, is_windows())
 }
 
@@ -270,7 +299,11 @@ pub fn npm_cli_js(root_dir: &Path, node: Option<&Path>) -> Option<PathBuf> {
         None => node_executable(root_dir, None)?,
     };
     let node_dir = node_path.parent()?;
-    let candidate = node_dir.join("node_modules").join("npm").join("bin").join("npm-cli.js");
+    let candidate = node_dir
+        .join("node_modules")
+        .join("npm")
+        .join("bin")
+        .join("npm-cli.js");
     if candidate.exists() {
         return Some(candidate);
     }
@@ -301,7 +334,10 @@ pub fn npm_cli_js(root_dir: &Path, node: Option<&Path>) -> Option<PathBuf> {
     None
 }
 
-pub fn codex_env(root_dir: &Path, base_env: Option<&HashMap<String, String>>) -> HashMap<String, String> {
+pub fn codex_env(
+    root_dir: &Path,
+    base_env: Option<&HashMap<String, String>>,
+) -> HashMap<String, String> {
     let mut env_map = base_env.cloned().unwrap_or_else(|| env::vars().collect());
     let node_dir = node_tools_dir(root_dir);
     let bin_dir = codex_bin_dir(&codex_install_prefix(root_dir));
@@ -342,14 +378,13 @@ pub fn codex_entrypoint_js(prefix: &Path) -> Option<PathBuf> {
     }
     let rel = rel?;
     let entry = pkg_json.parent()?.join(rel);
-    if entry.exists() {
-        Some(entry)
-    } else {
-        None
-    }
+    if entry.exists() { Some(entry) } else { None }
 }
 
-pub fn codex_cli_available(root_dir: Option<&Path>, env_map: Option<&HashMap<String, String>>) -> bool {
+pub fn codex_cli_available(
+    root_dir: Option<&Path>,
+    env_map: Option<&HashMap<String, String>>,
+) -> bool {
     if let Some(root) = root_dir {
         let node = node_executable(root, env_map);
         let entry = codex_entrypoint_js(&codex_install_prefix(root));
@@ -375,10 +410,7 @@ fn codex_base_argv_with_os(
         let node = node_executable_with_os(root, env_map, is_windows);
         let entry = codex_entrypoint_js(&codex_install_prefix(root));
         if let (Some(node), Some(entry)) = (node, entry) {
-            return vec![
-                node.to_string_lossy().to_string(),
-                entry.to_string_lossy().to_string(),
-            ];
+            return vec![path_for_cmd(&node), path_for_cmd(&entry)];
         }
     }
 
@@ -388,13 +420,23 @@ fn codex_base_argv_with_os(
             .or_else(|| env::var("PATH").ok());
         let resolved = find_in_path("codex", search_path.as_deref(), is_windows);
         if let Some(resolved) = resolved {
-            let suffix = resolved.extension().and_then(|s| s.to_str()).unwrap_or_default().to_lowercase();
+            let suffix = resolved
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_lowercase();
             if suffix == "cmd" || suffix == "bat" {
                 let comspec = env_map
                     .and_then(|env| env.get("COMSPEC").cloned())
                     .or_else(|| env::var("COMSPEC").ok())
                     .unwrap_or_else(|| "cmd.exe".to_string());
-                return vec![comspec, "/d".into(), "/s".into(), "/c".into(), resolved.to_string_lossy().to_string()];
+                return vec![
+                    comspec,
+                    "/d".into(),
+                    "/s".into(),
+                    "/c".into(),
+                    path_for_cmd(&resolved),
+                ];
             }
             if suffix == "ps1" {
                 let powershell = find_in_path("powershell", search_path.as_deref(), is_windows)
@@ -405,10 +447,10 @@ fn codex_base_argv_with_os(
                     "-ExecutionPolicy".into(),
                     "Bypass".into(),
                     "-File".into(),
-                    resolved.to_string_lossy().to_string(),
+                    path_for_cmd(&resolved),
                 ];
             }
-            return vec![resolved.to_string_lossy().to_string()];
+            return vec![path_for_cmd(&resolved)];
         }
     }
 
@@ -428,7 +470,10 @@ pub fn codex_login_argv(
     argv
 }
 
-pub fn codex_status_argv(root_dir: Option<&Path>, env_map: Option<&HashMap<String, String>>) -> Vec<String> {
+pub fn codex_status_argv(
+    root_dir: Option<&Path>,
+    env_map: Option<&HashMap<String, String>>,
+) -> Vec<String> {
     let mut argv = codex_base_argv_with_os(root_dir, env_map, is_windows());
     argv.push("login".to_string());
     argv.push("status".to_string());
@@ -461,7 +506,11 @@ pub fn codex_exec_argv(
     Ok(argv)
 }
 
-pub fn codex_install_argv(root_dir: &Path, prefix: &Path, package: &str) -> Result<Vec<String>, CodexError> {
+pub fn codex_install_argv(
+    root_dir: &Path,
+    prefix: &Path,
+    package: &str,
+) -> Result<Vec<String>, CodexError> {
     if package.trim().is_empty() {
         return Err(CodexError::EmptyPackage);
     }
@@ -469,11 +518,11 @@ pub fn codex_install_argv(root_dir: &Path, prefix: &Path, package: &str) -> Resu
     let npm = npm_cli_js(root_dir, Some(&node)).ok_or(CodexError::NpmMissing)?;
     let _ = std::fs::create_dir_all(prefix);
     Ok(vec![
-        node.to_string_lossy().to_string(),
-        npm.to_string_lossy().to_string(),
+        path_for_cmd(&node),
+        path_for_cmd(&npm),
         "install".to_string(),
         "--prefix".to_string(),
-        prefix.to_string_lossy().to_string(),
+        path_for_cmd(prefix),
         "--no-audit".to_string(),
         "--no-fund".to_string(),
         package.to_string(),
@@ -528,11 +577,19 @@ pub fn extract_status_code(msg: &str) -> Option<u16> {
 
 pub fn codex_hint_for_status(status: u16) -> Option<String> {
     match status {
-        401 => Some("401 = authentification invalide -> Ctrl+K (login) ou `codex logout` + login ChatGPT.".to_string()),
-        403 => Some("403 = acces interdit -> verifie login ChatGPT (pas API key) / droits / reseau.".to_string()),
+        401 => Some(
+            "401 = authentification invalide -> Ctrl+K (login) ou `codex logout` + login ChatGPT."
+                .to_string(),
+        ),
+        403 => Some(
+            "403 = acces interdit -> verifie login ChatGPT (pas API key) / droits / reseau."
+                .to_string(),
+        ),
         407 => Some("407 = proxy auth required -> configure HTTP_PROXY/HTTPS_PROXY.".to_string()),
         429 => Some("429 = rate limit -> reessaie plus tard / ralentis.".to_string()),
-        500..=599 => Some("5xx = erreur serveur -> reessaie, possible incident cote OpenAI.".to_string()),
+        500..=599 => {
+            Some("5xx = erreur serveur -> reessaie, possible incident cote OpenAI.".to_string())
+        }
         _ => None,
     }
 }
@@ -544,8 +601,12 @@ fn extract_text_from_content(content: &Value) -> Vec<String> {
             for item in items {
                 if let Value::Object(map) = item {
                     if let Some(Value::String(item_type)) = map.get("type") {
-                        if ["output_text", "output_markdown", "text", "input_text"].contains(&item_type.as_str()) {
-                            if let Some(Value::String(text)) = map.get("text").or_else(|| map.get("content")) {
+                        if ["output_text", "output_markdown", "text", "input_text"]
+                            .contains(&item_type.as_str())
+                        {
+                            if let Some(Value::String(text)) =
+                                map.get("text").or_else(|| map.get("content"))
+                            {
                                 if !text.is_empty() {
                                     texts.push(text.clone());
                                 }
@@ -566,7 +627,10 @@ fn extract_text_from_content(content: &Value) -> Vec<String> {
 fn push_item(items: &mut Vec<DisplayItem>, kind: DisplayKind, msg: &Value) {
     if let Value::String(text) = msg {
         if !text.is_empty() {
-            items.push(DisplayItem { kind, message: text.clone() });
+            items.push(DisplayItem {
+                kind,
+                message: text.clone(),
+            });
         }
     }
 }
@@ -588,14 +652,20 @@ fn items_from_message_payload(payload: &Value) -> Vec<DisplayItem> {
     let texts = extract_text_from_content(content);
     if !texts.is_empty() {
         for text in texts {
-            items.push(DisplayItem { kind: kind.clone(), message: text });
+            items.push(DisplayItem {
+                kind: kind.clone(),
+                message: text,
+            });
         }
         return items;
     }
 
     if let Some(Value::String(msg)) = payload.get("message") {
         if !msg.is_empty() {
-            items.push(DisplayItem { kind, message: msg.clone() });
+            items.push(DisplayItem {
+                kind,
+                message: msg.clone(),
+            });
         }
     }
     items
@@ -605,26 +675,47 @@ fn items_from_item_payload(item: &Value) -> Vec<DisplayItem> {
     let mut items = Vec::new();
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
 
-
     if item_type == "message" {
         return items_from_message_payload(item);
     }
 
     if item_type == "agent_message" || item_type == "assistant_message" {
         for text in extract_text_from_content(item.get("content").unwrap_or(&Value::Null)) {
-            items.push(DisplayItem { kind: DisplayKind::Assistant, message: text });
+            items.push(DisplayItem {
+                kind: DisplayKind::Assistant,
+                message: text,
+            });
         }
-        push_item(&mut items, DisplayKind::Assistant, item.get("text").unwrap_or(&Value::Null));
-        push_item(&mut items, DisplayKind::Assistant, item.get("message").unwrap_or(&Value::Null));
+        push_item(
+            &mut items,
+            DisplayKind::Assistant,
+            item.get("text").unwrap_or(&Value::Null),
+        );
+        push_item(
+            &mut items,
+            DisplayKind::Assistant,
+            item.get("message").unwrap_or(&Value::Null),
+        );
         return items;
     }
 
     if item_type == "user_message" || item_type == "user" {
         for text in extract_text_from_content(item.get("content").unwrap_or(&Value::Null)) {
-            items.push(DisplayItem { kind: DisplayKind::User, message: text });
+            items.push(DisplayItem {
+                kind: DisplayKind::User,
+                message: text,
+            });
         }
-        push_item(&mut items, DisplayKind::User, item.get("text").unwrap_or(&Value::Null));
-        push_item(&mut items, DisplayKind::User, item.get("message").unwrap_or(&Value::Null));
+        push_item(
+            &mut items,
+            DisplayKind::User,
+            item.get("text").unwrap_or(&Value::Null),
+        );
+        push_item(
+            &mut items,
+            DisplayKind::User,
+            item.get("message").unwrap_or(&Value::Null),
+        );
     }
     items
 }
@@ -651,8 +742,15 @@ fn iter_tool_calls(containers: &[&Value]) -> Vec<Value> {
 }
 
 fn format_action(payload: &Value) -> Option<String> {
-    let raw_type = payload.get("type").and_then(Value::as_str).unwrap_or("").to_lowercase();
-    let is_action = matches!(raw_type.as_str(), "tool_call" | "function_call" | "action" | "tool");
+    let raw_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_lowercase();
+    let is_action = matches!(
+        raw_type.as_str(),
+        "tool_call" | "function_call" | "action" | "tool"
+    );
     if !is_action {
         let has_name = payload.get("name").is_some()
             || payload.get("tool").is_some()
@@ -677,7 +775,9 @@ fn format_action(payload: &Value) -> Option<String> {
         .or_else(|| payload.get("input"))
         .or_else(|| payload.get("parameters"));
 
-    let description = payload.get("message").or_else(|| payload.get("description"));
+    let description = payload
+        .get("message")
+        .or_else(|| payload.get("description"));
     if let Some(Value::String(desc)) = description {
         if !desc.trim().is_empty() && name.is_none() && args.is_none() {
             return Some(desc.trim().to_string());
@@ -710,7 +810,10 @@ pub fn extract_display_items(obj: &Value) -> Vec<DisplayItem> {
     if event_type == Some("event_msg") {
         if let Value::Object(map) = payload {
             let payload_type = map.get("type").and_then(Value::as_str);
-            let msg = map.get("message").or_else(|| map.get("text")).unwrap_or(&Value::Null);
+            let msg = map
+                .get("message")
+                .or_else(|| map.get("text"))
+                .unwrap_or(&Value::Null);
             match payload_type {
                 Some("agent_message") | Some("assistant_message") => {
                     push_item(&mut items, DisplayKind::Assistant, msg);
@@ -720,7 +823,10 @@ pub fn extract_display_items(obj: &Value) -> Vec<DisplayItem> {
                 }
                 _ => {
                     if let Some(action) = format_action(payload) {
-                        items.push(DisplayItem { kind: DisplayKind::Action, message: action });
+                        items.push(DisplayItem {
+                            kind: DisplayKind::Action,
+                            message: action,
+                        });
                     }
                 }
             }
@@ -730,25 +836,41 @@ pub fn extract_display_items(obj: &Value) -> Vec<DisplayItem> {
     if event_type == Some("response_item") {
         items.extend(items_from_message_payload(payload));
         if let Some(action) = format_action(payload) {
-            items.push(DisplayItem { kind: DisplayKind::Action, message: action });
+            items.push(DisplayItem {
+                kind: DisplayKind::Action,
+                message: action,
+            });
         }
     }
 
-    if matches!(event_type, Some("response.output_text.done") | Some("response.output_text")) {
-        push_item(&mut items, DisplayKind::Assistant, obj.get("text").unwrap_or(&Value::Null));
+    if matches!(
+        event_type,
+        Some("response.output_text.done") | Some("response.output_text")
+    ) {
+        push_item(
+            &mut items,
+            DisplayKind::Assistant,
+            obj.get("text").unwrap_or(&Value::Null),
+        );
     }
 
     let item = obj.get("item").unwrap_or(&Value::Null);
     if item.is_object() {
         items.extend(items_from_item_payload(item));
         if let Some(action) = format_action(item) {
-            items.push(DisplayItem { kind: DisplayKind::Action, message: action });
+            items.push(DisplayItem {
+                kind: DisplayKind::Action,
+                message: action,
+            });
         }
     }
 
     for call in iter_tool_calls(&[obj, payload, item]) {
         if let Some(action) = format_action(&call) {
-            items.push(DisplayItem { kind: DisplayKind::Action, message: action });
+            items.push(DisplayItem {
+                kind: DisplayKind::Action,
+                message: action,
+            });
         }
     }
 
@@ -861,14 +983,24 @@ mod tests {
 
     fn create_portable_node(root_dir: &Path) -> PathBuf {
         let node_dir = root_dir.join("tools").join("node");
-        let node_path = if is_windows() { node_dir.join("node.exe") } else { node_dir.join("node") };
+        let node_path = if is_windows() {
+            node_dir.join("node.exe")
+        } else {
+            node_dir.join("node")
+        };
         fs::create_dir_all(node_path.parent().unwrap()).unwrap();
         fs::write(&node_path, "").unwrap();
         node_path
     }
 
     fn create_npm_cli(node_path: &Path) -> PathBuf {
-        let npm_path = node_path.parent().unwrap().join("node_modules").join("npm").join("bin").join("npm-cli.js");
+        let npm_path = node_path
+            .parent()
+            .unwrap()
+            .join("node_modules")
+            .join("npm")
+            .join("bin")
+            .join("npm-cli.js");
         fs::create_dir_all(npm_path.parent().unwrap()).unwrap();
         fs::write(&npm_path, "").unwrap();
         npm_path
@@ -954,8 +1086,14 @@ mod tests {
         let mut base = HashMap::new();
         base.insert("PATH".to_string(), "/bin".to_string());
         let env_map = codex_env(root_dir, Some(&base));
-        let expected_bin = codex_bin_dir(&codex_install_prefix(root_dir)).to_string_lossy().to_string();
-        let expected_node = root_dir.join("tools").join("node").to_string_lossy().to_string();
+        let expected_bin = codex_bin_dir(&codex_install_prefix(root_dir))
+            .to_string_lossy()
+            .to_string();
+        let expected_node = root_dir
+            .join("tools")
+            .join("node")
+            .to_string_lossy()
+            .to_string();
         let path = env_map.get("PATH").unwrap();
         assert!(path.starts_with(&expected_bin));
         assert!(path.contains(&expected_node));
@@ -1048,7 +1186,9 @@ mod tests {
         let mut base = HashMap::new();
         base.insert("PATH".to_string(), "/bin".to_string());
         let env_map = tools_env(root_dir, Some(&base));
-        let expected_bin = python_scripts_dir(&tools_install_prefix(root_dir)).to_string_lossy().to_string();
+        let expected_bin = python_scripts_dir(&tools_install_prefix(root_dir))
+            .to_string_lossy()
+            .to_string();
         let path = env_map.get("PATH").unwrap();
         assert!(path.starts_with(&expected_bin));
         assert_eq!(base.get("PATH").unwrap(), "/bin");
@@ -1065,7 +1205,13 @@ mod tests {
     #[test]
     fn pip_install_argv_ok() {
         let prefix = Path::new("/tmp/usbide/.usbide/tools");
-        let argv = pip_install_argv(prefix, &["ruff".to_string(), "black".to_string()], None, false).unwrap();
+        let argv = pip_install_argv(
+            prefix,
+            &["ruff".to_string(), "black".to_string()],
+            None,
+            false,
+        )
+        .unwrap();
         assert!(argv.contains(&"--prefix".to_string()));
         assert!(argv.contains(&prefix.to_string_lossy().to_string()));
         assert!(argv.contains(&"ruff".to_string()));
@@ -1113,7 +1259,8 @@ mod tests {
         let dist_dir = Path::new("/tmp/usbide/dist");
         let work_dir = Path::new("/tmp/usbide/build");
         let spec_dir = Path::new("/tmp/usbide");
-        let argv = pyinstaller_build_argv(script, dist_dir, false, Some(work_dir), Some(spec_dir)).unwrap();
+        let argv = pyinstaller_build_argv(script, dist_dir, false, Some(work_dir), Some(spec_dir))
+            .unwrap();
         assert!(argv.contains(&"--workpath".to_string()));
         assert!(argv.contains(&work_dir.to_string_lossy().to_string()));
         assert!(argv.contains(&"--specpath".to_string()));
@@ -1122,12 +1269,24 @@ mod tests {
 
     #[test]
     fn pyinstaller_build_argv_rejecte_vide() {
-        assert!(pyinstaller_build_argv(Path::new(""), Path::new("/tmp/usbide/dist"), false, None, None).is_err());
+        assert!(
+            pyinstaller_build_argv(
+                Path::new(""),
+                Path::new("/tmp/usbide/dist"),
+                false,
+                None,
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn extract_status_code_ok() {
-        assert_eq!(extract_status_code("unexpected status 401 Unauthorized"), Some(401));
+        assert_eq!(
+            extract_status_code("unexpected status 401 Unauthorized"),
+            Some(401)
+        );
         assert_eq!(extract_status_code("last status: 403 Forbidden"), Some(403));
         assert_eq!(extract_status_code("HTTP 429"), Some(429));
         assert_eq!(extract_status_code("aucun code ici"), None);
@@ -1175,7 +1334,11 @@ mod tests {
             }
         });
         let items = extract_display_items(&obj);
-        assert!(items.iter().any(|item| item.kind == DisplayKind::User && item.message == "Bonjour"));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.kind == DisplayKind::User && item.message == "Bonjour")
+        );
     }
 
     #[test]
@@ -1195,7 +1358,11 @@ mod tests {
             "item": {"type": "agent_message", "text": "Salut"}
         });
         let items = extract_display_items(&obj);
-        assert!(items.iter().any(|item| item.kind == DisplayKind::Assistant && item.message == "Salut"));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.kind == DisplayKind::Assistant && item.message == "Salut")
+        );
     }
 
     #[test]
@@ -1211,13 +1378,21 @@ mod tests {
     #[test]
     fn wrap_text_wrappe() {
         let lines = wrap_text("Texte tres long avec des espaces pour verifier le wrap", 24);
-        assert!(lines.iter().all(|line| line.len() <= 24 || line.starts_with("```")));
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.len() <= 24 || line.starts_with("```"))
+        );
     }
 
     #[test]
     fn wrap_text_coupe_mot_long() {
         let lines = wrap_text("AAAAAAAAAAAAAAAAAAAA", 18);
-        assert!(lines.iter().all(|line| line.len() <= 18 || line.starts_with("```")));
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.len() <= 18 || line.starts_with("```"))
+        );
     }
 
     #[test]

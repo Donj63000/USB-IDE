@@ -28,8 +28,12 @@ fn main() -> Result<()> {
         UiMode::Tui => {
             if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
                 eprintln!("Interface terminal (TUI) : aucun TTY detecte.");
-                eprintln!("Lance l'app dans un vrai terminal (Windows Terminal / PowerShell / cmd).");
-                eprintln!("Dans RustRover : active 'Emulate terminal in output console' ou 'Run in Terminal'.");
+                eprintln!(
+                    "Lance l'app dans un vrai terminal (Windows Terminal / PowerShell / cmd)."
+                );
+                eprintln!(
+                    "Dans RustRover : active 'Emulate terminal in output console' ou 'Run in Terminal'."
+                );
                 return Ok(());
             }
             ide_usb::ui::run(args.root)

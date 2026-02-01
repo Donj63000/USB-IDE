@@ -42,14 +42,18 @@ fn decode_with_encoding(bytes: &[u8], encoding: &str) -> Option<(String, bool)> 
         };
         match String::from_utf8(stripped.to_vec()) {
             Ok(text) => return Some((text, false)),
-            Err(err) => return Some((String::from_utf8_lossy(&err.into_bytes()).to_string(), true)),
+            Err(err) => {
+                return Some((String::from_utf8_lossy(&err.into_bytes()).to_string(), true));
+            }
         }
     }
 
     if encoding_lower == "utf-8" {
         match String::from_utf8(bytes.to_vec()) {
             Ok(text) => return Some((text, false)),
-            Err(err) => return Some((String::from_utf8_lossy(&err.into_bytes()).to_string(), true)),
+            Err(err) => {
+                return Some((String::from_utf8_lossy(&err.into_bytes()).to_string(), true));
+            }
         }
     }
 
@@ -60,7 +64,12 @@ fn decode_with_encoding(bytes: &[u8], encoding: &str) -> Option<(String, bool)> 
 
 /// Détecte un encodage raisonnable pour un fichier (PEP 263 pour .py).
 pub fn detect_text_encoding(path: &Path) -> String {
-    if path.extension().and_then(|ext| ext.to_str()).map(|s| s.eq_ignore_ascii_case("py")).unwrap_or(false) {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|s| s.eq_ignore_ascii_case("py"))
+        .unwrap_or(false)
+    {
         if let Some(enc) = detect_python_encoding(path) {
             return enc;
         }
