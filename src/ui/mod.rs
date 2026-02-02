@@ -19,11 +19,13 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 use tui_textarea::{Input, TextArea};
 
 use crate::codex::{
-    DisplayKind, codex_cli_available, codex_entrypoint_js, codex_env, codex_exec_argv,
-    codex_hint_for_status, codex_install_argv, codex_install_prefix, codex_login_argv,
+    CodexApprovalPolicy, CodexError, CodexSandboxMode, DisplayKind, codex_approval_policy_from_env,
+    codex_cli_available, codex_entrypoint_js, codex_env, codex_exec_argv, codex_hint_for_status,
+    codex_install_argv, codex_install_prefix, codex_login_argv, codex_sandbox_mode_from_env,
     codex_status_argv, extract_display_items, extract_status_code, node_executable,
     parse_tool_list, pip_install_argv, pyinstaller_available, pyinstaller_build_argv,
     pyinstaller_install_argv, resolve_in_path, tools_env, tools_install_prefix,
+    translate_codex_line,
 };
 use crate::fs::{detect_text_encoding, is_probably_binary, read_text_with_encoding};
 use crate::process::{
@@ -349,6 +351,15 @@ struct App {
     title: String,
     sub_title: String,
     codex_compact_view: bool,
+    codex_sandbox_mode: CodexSandboxMode,
+    codex_approval_policy: CodexApprovalPolicy,
+    codex_sandbox_supported: Option<bool>,
+    codex_approval_supported: Option<bool>,
+    codex_exec_used_sandbox_flag: bool,
+    codex_exec_used_approval_flag: bool,
+    codex_last_prompt: Option<String>,
+    codex_retry_without_sandbox: bool,
+    codex_retry_without_approval: bool,
     last_codex_message: Option<String>,
     codex_assistant_buffer: String,
     running: Vec<RunningProcess>,
@@ -377,6 +388,15 @@ impl App {
             title: APP_NAME.to_string(),
             sub_title: String::new(),
             codex_compact_view: true,
+            codex_sandbox_mode: codex_sandbox_mode_from_env(),
+            codex_approval_policy: codex_approval_policy_from_env(),
+            codex_sandbox_supported: None,
+            codex_approval_supported: None,
+            codex_exec_used_sandbox_flag: false,
+            codex_exec_used_approval_flag: false,
+            codex_last_prompt: None,
+            codex_retry_without_sandbox: false,
+            codex_retry_without_approval: false,
             last_codex_message: None,
             codex_assistant_buffer: String::new(),
             running: Vec::new(),
@@ -389,8 +409,16 @@ impl App {
         app.ensure_portable_dirs();
         app.refresh_title();
         app.log_ui(format!(
-            "{APP_NAME}\nRoot: {}\nShell: champ 'Commande' - Codex: champ 'Codex' - Ctrl+K login - Ctrl+I install\n",
+            "{APP_NAME}\nRoot: {}\nShell: champ 'Commande' - Codex: champ 'Codex' - Ctrl+K login - Ctrl+I install - Ctrl+O sandbox - Ctrl+P approb\n",
             app.root_dir.display()
+        ));
+        app.codex_log_ui(format!(
+            "Sandbox Codex: {}",
+            Self::codex_sandbox_label(app.codex_sandbox_mode)
+        ));
+        app.codex_log_ui(format!(
+            "Approbations Codex: {}",
+            Self::codex_approval_label(app.codex_approval_policy)
         ));
         Ok(app)
     }
@@ -450,7 +478,7 @@ impl App {
     }
 
     fn draw_footer(&self, f: &mut ratatui::Frame<'_>, area: Rect) {
-        let help = "Ctrl+S sauver | F5 executer | Ctrl+Q quitter | Tab focus";
+        let help = "Ctrl+S sauver | F5 executer | Ctrl+O sandbox | Ctrl+P approb | Ctrl+Q quitter | Tab focus";
         let footer = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
         f.render_widget(footer, area);
     }
@@ -631,6 +659,14 @@ impl App {
                 }
                 KeyCode::Char('m') => {
                     self.action_toggle_codex_view();
+                    return false;
+                }
+                KeyCode::Char('o') => {
+                    self.action_toggle_codex_sandbox();
+                    return false;
+                }
+                KeyCode::Char('p') => {
+                    self.action_toggle_codex_approval();
                     return false;
                 }
                 KeyCode::Char('e') => {
@@ -880,6 +916,27 @@ impl App {
         codex_env(&self.root_dir, Some(&env_map))
     }
 
+    fn ensure_node_available(
+        &mut self,
+        env_map: &HashMap<String, String>,
+        target: LogTarget,
+    ) -> bool {
+        if node_executable(&self.root_dir, Some(env_map)).is_some() {
+            return true;
+        }
+        let expected = self.root_dir.join("tools").join("node");
+        self.log_issue(
+            &format!(
+                "Node portable introuvable. Place node dans {} (ex: node.exe) ou ajoute node au PATH.",
+                expected.display()
+            ),
+            "erreur",
+            "node",
+            target,
+        );
+        false
+    }
+
     fn tools_env(&self) -> HashMap<String, String> {
         let mut env_map: HashMap<String, String> = std::env::vars().collect();
         env_map
@@ -1100,20 +1157,133 @@ impl App {
         self.codex_log_ui(format!("Mode Codex: {mode}"));
     }
 
+    fn action_toggle_codex_sandbox(&mut self) {
+        self.codex_sandbox_mode = Self::next_codex_sandbox_mode(self.codex_sandbox_mode);
+        self.codex_log_ui(format!(
+            "Sandbox Codex: {}",
+            Self::codex_sandbox_label(self.codex_sandbox_mode)
+        ));
+    }
+
+    fn action_toggle_codex_approval(&mut self) {
+        self.codex_approval_policy = Self::next_codex_approval_policy(self.codex_approval_policy);
+        self.codex_log_ui(format!(
+            "Approbations Codex: {}",
+            Self::codex_approval_label(self.codex_approval_policy)
+        ));
+    }
+
     fn action_codex_install(&mut self) {
         let _ = self.install_codex(true, LogTarget::Codex);
+    }
+
+    fn codex_exec_extra_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.codex_sandbox_supported != Some(false) {
+            args.push("--sandbox".to_string());
+            args.push(self.codex_sandbox_mode.as_str().to_string());
+        }
+        if self.codex_approval_supported != Some(false) {
+            args.push("--ask-for-approval".to_string());
+            args.push(self.codex_approval_policy.as_str().to_string());
+        }
+        args
+    }
+
+    fn codex_sandbox_label(mode: CodexSandboxMode) -> &'static str {
+        match mode {
+            CodexSandboxMode::ReadOnly => "lecture seule",
+            CodexSandboxMode::WorkspaceWrite => "agent (workspace)",
+            CodexSandboxMode::DangerFullAccess => "danger (acces complet)",
+        }
+    }
+
+    fn codex_approval_label(policy: CodexApprovalPolicy) -> &'static str {
+        match policy {
+            CodexApprovalPolicy::Untrusted => "non fiable",
+            CodexApprovalPolicy::OnFailure => "sur echec",
+            CodexApprovalPolicy::OnRequest => "sur demande",
+            CodexApprovalPolicy::Never => "jamais",
+        }
+    }
+
+    fn next_codex_sandbox_mode(mode: CodexSandboxMode) -> CodexSandboxMode {
+        match mode {
+            CodexSandboxMode::ReadOnly => CodexSandboxMode::WorkspaceWrite,
+            CodexSandboxMode::WorkspaceWrite => CodexSandboxMode::DangerFullAccess,
+            CodexSandboxMode::DangerFullAccess => CodexSandboxMode::ReadOnly,
+        }
+    }
+
+    fn next_codex_approval_policy(policy: CodexApprovalPolicy) -> CodexApprovalPolicy {
+        match policy {
+            CodexApprovalPolicy::OnRequest => CodexApprovalPolicy::OnFailure,
+            CodexApprovalPolicy::OnFailure => CodexApprovalPolicy::Untrusted,
+            CodexApprovalPolicy::Untrusted => CodexApprovalPolicy::Never,
+            CodexApprovalPolicy::Never => CodexApprovalPolicy::OnRequest,
+        }
+    }
+
+    fn approval_flag_error(line: &str) -> bool {
+        let lower = line.to_lowercase();
+        lower.contains("--ask-for-approval")
+            && (lower.contains("unexpected argument")
+                || lower.contains("unknown argument")
+                || lower.contains("unrecognized"))
+    }
+
+    fn sandbox_flag_error(line: &str) -> bool {
+        let lower = line.to_lowercase();
+        lower.contains("--sandbox")
+            && (lower.contains("unexpected argument")
+                || lower.contains("unknown argument")
+                || lower.contains("unrecognized"))
+    }
+
+    fn sandbox_value_error(line: &str) -> bool {
+        let lower = line.to_lowercase();
+        lower.contains("--sandbox")
+            && (lower.contains("invalid value") || lower.contains("possible values"))
+    }
+
+    fn handle_approval_flag_line(&mut self, line: &str) -> bool {
+        if !self.codex_exec_used_approval_flag || !Self::approval_flag_error(line) {
+            return false;
+        }
+        if self.codex_approval_supported != Some(false) {
+            self.codex_approval_supported = Some(false);
+            self.codex_log_action(
+                "Option --ask-for-approval non supportee par cette version Codex. Relance sans approbations.",
+            );
+        }
+        self.codex_retry_without_approval = true;
+        true
+    }
+
+    fn handle_sandbox_flag_line(&mut self, line: &str) -> bool {
+        if !self.codex_exec_used_sandbox_flag {
+            return false;
+        }
+        if Self::sandbox_flag_error(line) || Self::sandbox_value_error(line) {
+            if self.codex_sandbox_supported != Some(false) {
+                self.codex_sandbox_supported = Some(false);
+                self.codex_log_action(
+                    "Option --sandbox non supportee par cette version Codex. Relance sans sandbox (mode par defaut).",
+                );
+            }
+            self.codex_retry_without_sandbox = true;
+            return true;
+        }
+        false
     }
 
     fn action_codex_login(&mut self) {
         let env_map = self.codex_env();
         if !codex_cli_available(Some(&self.root_dir), Some(&env_map)) {
+            if !self.ensure_node_available(&env_map, LogTarget::Codex) {
+                return;
+            }
             if !self.install_codex(false, LogTarget::Codex) {
-                self.log_issue(
-                    "Codex introuvable.",
-                    "erreur",
-                    "codex_login",
-                    LogTarget::Codex,
-                );
                 return;
             }
         }
@@ -1142,6 +1312,9 @@ impl App {
     fn action_codex_check(&mut self) {
         let env_map = self.codex_env();
         if !codex_cli_available(Some(&self.root_dir), Some(&env_map)) {
+            if !self.ensure_node_available(&env_map, LogTarget::Codex) {
+                return;
+            }
             self.log_issue(
                 "Codex non installe.",
                 "avertissement",
@@ -1362,24 +1535,62 @@ impl App {
             return true;
         }
         if !force && self.codex_install_attempted {
-            return false;
-        }
-        if !force && !self.codex_auto_install_enabled() {
             self.log_issue(
-                "Auto-install Codex desactive.",
+                "Installation Codex deja tentee. (Ctrl+I pour forcer)",
                 "avertissement",
                 "installation_codex",
                 target,
             );
             return false;
         }
+        if !force && !self.codex_auto_install_enabled() {
+            self.log_issue(
+                "Auto-install Codex desactive. (Ctrl+I pour installer)",
+                "avertissement",
+                "installation_codex",
+                target,
+            );
+            return false;
+        }
+        if !self.ensure_node_available(&env_map, target) {
+            return false;
+        }
         self.codex_install_attempted = true;
         let package = std::env::var("USBIDE_CODEX_NPM_PACKAGE")
             .unwrap_or_else(|_| "@openai/codex".to_string());
         let prefix = codex_install_prefix(&self.root_dir);
-        let _ = fs::create_dir_all(&prefix);
+        if let Err(err) = fs::create_dir_all(&prefix) {
+            self.log_issue(
+                &format!(
+                    "Impossible de creer le dossier d'installation Codex: {} ({err})",
+                    prefix.display()
+                ),
+                "erreur",
+                "installation_codex",
+                target,
+            );
+            return false;
+        }
         let argv = match codex_install_argv(&self.root_dir, &prefix, &package) {
             Ok(argv) => argv,
+            Err(CodexError::NodeMissing) => {
+                self.log_issue(
+                    "Node portable introuvable. Place node dans tools/node (ex: node.exe) ou ajoute node au PATH.",
+                    "erreur",
+                    "installation_codex",
+                    target,
+                );
+                return false;
+            }
+            Err(CodexError::NpmMissing) => {
+                self.log_issue(
+                    "npm-cli.js introuvable. Verifie ton Node portable (npm inclus).",
+                    "erreur",
+                    "installation_codex",
+                    target,
+                );
+                return false;
+            }
             Err(err) => {
                 self.log_issue(
                     &format!("Impossible d'installer Codex: {err}"),
@@ -1438,16 +1649,11 @@ impl App {
         }
         let env_map = self.codex_env();
         if !codex_cli_available(Some(&self.root_dir), Some(&env_map)) {
-            let installed = self.install_codex(false, LogTarget::Codex);
-            if installed {
+            if !self.ensure_node_available(&env_map, LogTarget::Codex) {
+                return;
+            }
+            if self.install_codex(false, LogTarget::Codex) {
                 self.pending_codex_prompt = Some(prompt);
-            } else {
-                self.log_issue(
-                    "Codex indisponible. (Ctrl+I pour installer)",
-                    "erreur",
-                    "codex_exec",
-                    LogTarget::Codex,
-                );
             }
             return;
         }
@@ -1545,12 +1751,18 @@ impl App {
                 if let Some(prompt) = self.pending_codex_prompt.take() {
                     if code == Some(0) {
                         let env_map = self.codex_env();
+                        let extra_args = self.codex_exec_extra_args();
+                        self.codex_exec_used_sandbox_flag =
+                            extra_args.iter().any(|arg| arg == "--sandbox");
+                        self.codex_exec_used_approval_flag =
+                            extra_args.iter().any(|arg| arg == "--ask-for-approval");
+                        self.codex_last_prompt = Some(prompt.clone());
                         match codex_exec_argv(
                             &prompt,
                             Some(&self.root_dir),
                             Some(&env_map),
                             true,
-                            None,
+                            Some(&extra_args),
                         ) {
                             Ok(argv) => {
                                 if !self.codex_compact_view {
@@ -1574,8 +1786,15 @@ impl App {
                             }
                         }
                     } else {
-                        self.codex_log_action("Codex n'est pas authentifie dans ce CODEX_HOME.");
-                        self.codex_log_action("Fais Ctrl+K pour `codex login` (ou device auth).");
+                        self.codex_log_action(
+                            "Echec de la verification du login Codex (status en erreur).",
+                        );
+                        self.codex_log_action(
+                            "Si tu n'es pas authentifie, fais Login puis recommence.",
+                        );
+                        self.codex_log_action(
+                            "Si tu es deja authentifie, verifie l'installation et la connexion.",
+                        );
                         if !self.codex_device_auth_enabled() {
                             self.codex_log_action(
                                 "Astuce: si le navigateur ne s'ouvre pas, definis USBIDE_CODEX_DEVICE_AUTH=1 puis Ctrl+K.",
@@ -1588,6 +1807,34 @@ impl App {
                 if self.codex_compact_view && !self.codex_assistant_buffer.is_empty() {
                     let message = std::mem::take(&mut self.codex_assistant_buffer);
                     self.codex_log_message(&message);
+                }
+                if self.codex_retry_without_sandbox || self.codex_retry_without_approval {
+                    self.codex_retry_without_sandbox = false;
+                    self.codex_retry_without_approval = false;
+                    if let Some(prompt) = self.codex_last_prompt.clone() {
+                        let env_map = self.codex_env();
+                        let extra_args = self.codex_exec_extra_args();
+                        self.codex_exec_used_sandbox_flag =
+                            extra_args.iter().any(|arg| arg == "--sandbox");
+                        self.codex_exec_used_approval_flag =
+                            extra_args.iter().any(|arg| arg == "--ask-for-approval");
+                        if let Ok(argv) = codex_exec_argv(
+                            &prompt,
+                            Some(&self.root_dir),
+                            Some(&env_map),
+                            true,
+                            Some(&extra_args),
+                        ) {
+                            self.codex_log_ui(format!("$ {}", argv.join(" ")));
+                            self.spawn_process(
+                                argv,
+                                env_map,
+                                "codex_exec",
+                                LogTarget::Codex,
+                                ProcessKind::CodexExec,
+                            );
+                        }
+                    }
                 }
             }
             ProcessKind::CodexInstall => {
@@ -1606,6 +1853,20 @@ impl App {
     fn handle_codex_line(&mut self, line: &str) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            return;
+        }
+        if self.handle_sandbox_flag_line(trimmed) || self.handle_approval_flag_line(trimmed) {
+            return;
+        }
+        if self.codex_retry_without_sandbox || self.codex_retry_without_approval {
+            return;
+        }
+        if let Some(translated) = translate_codex_line(trimmed) {
+            if self.codex_compact_view {
+                self.codex_log_action(&translated);
+            } else {
+                self.codex_log_ui(translated);
+            }
             return;
         }
 
@@ -1658,16 +1919,20 @@ impl App {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             if self.codex_compact_view {
-                if let Some(status) = extract_status_code(msg) {
-                    self.codex_log_action(&format!("Erreur Codex HTTP {status}: {msg}"));
+                if let Some(translated) = translate_codex_line(msg) {
+                    self.codex_log_action(&translated);
+                } else if let Some(status) = extract_status_code(msg) {
+                    self.codex_log_action(&format!("Erreur Codex HTTP {status}."));
                     if let Some(hint) = codex_hint_for_status(status) {
                         self.codex_log_action(&hint);
                     }
                 } else {
-                    self.codex_log_action(&format!("Erreur Codex: {msg}"));
+                    self.codex_log_action(
+                        "Erreur Codex: une erreur est survenue. Consulte le journal ou relance.",
+                    );
                 }
             } else {
-                self.codex_log_ui(format!("Erreur Codex: {msg}"));
+                self.codex_log_ui("Erreur Codex: une erreur est survenue.".to_string());
             }
             return;
         }
@@ -1679,16 +1944,18 @@ impl App {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             if self.codex_compact_view {
-                if let Some(status) = extract_status_code(msg) {
-                    self.codex_log_action(&format!("Task echouee HTTP {status}: {msg}"));
+                if let Some(translated) = translate_codex_line(msg) {
+                    self.codex_log_action(&translated);
+                } else if let Some(status) = extract_status_code(msg) {
+                    self.codex_log_action(&format!("Tache echouee HTTP {status}."));
                     if let Some(hint) = codex_hint_for_status(status) {
                         self.codex_log_action(&hint);
                     }
                 } else {
-                    self.codex_log_action(&format!("Task echouee: {msg}"));
+                    self.codex_log_action("Tache echouee: une erreur est survenue.");
                 }
             } else {
-                self.codex_log_ui(format!("Task echouee: {msg}"));
+                self.codex_log_ui("Tache echouee.".to_string());
             }
             return;
         }
@@ -1718,19 +1985,37 @@ impl App {
             return;
         }
         self.last_codex_message = Some(fingerprint);
-        self.push_log(
-            LogTarget::Codex,
-            label.to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        );
+        let (label_style, line_style) = match kind {
+            "assistant" => (
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Green),
+            ),
+            "user" => (
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Blue),
+            ),
+            "action" => (
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::DarkGray),
+            ),
+            _ => (
+                Style::default().add_modifier(Modifier::BOLD),
+                Style::default(),
+            ),
+        };
+        self.push_log(LogTarget::Codex, label.to_string(), label_style);
         let width = self.last_codex_width.saturating_sub(4) as usize;
         for line in crate::codex::wrap_text(msg, width) {
             if line.is_empty() {
                 self.push_log(LogTarget::Codex, String::new(), Style::default());
-            } else if kind == "assistant" {
-                self.push_log(LogTarget::Codex, line, Style::default().fg(Color::Green));
             } else {
-                self.push_log(LogTarget::Codex, line, Style::default());
+                self.push_log(LogTarget::Codex, line, line_style);
             }
         }
         self.push_log(LogTarget::Codex, String::new(), Style::default());
@@ -1762,6 +2047,10 @@ mod tests {
         f();
     }
 
+    fn canonical_root(path: &Path) -> PathBuf {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    }
+
     fn set_env(key: &str, value: &str) {
         unsafe {
             std::env::set_var(key, value);
@@ -1778,8 +2067,9 @@ mod tests {
     fn refresh_title_sans_fichier() {
         let dir = TempDir::new().unwrap();
         let app = App::new(dir.path().to_path_buf()).unwrap();
+        let expected_root = canonical_root(dir.path());
         assert_eq!(app.title, APP_NAME);
-        assert_eq!(app.sub_title, dir.path().display().to_string());
+        assert_eq!(app.sub_title, expected_root.display().to_string());
     }
 
     #[test]
@@ -1802,13 +2092,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let app = App::new(dir.path().to_path_buf()).unwrap();
         let env = app.portable_env(HashMap::new());
+        let expected_root = canonical_root(dir.path());
         assert_eq!(
             env.get("PIP_CACHE_DIR").unwrap(),
-            &dir.path().join("cache").join("pip").display().to_string()
+            &expected_root
+                .join("cache")
+                .join("pip")
+                .display()
+                .to_string()
         );
         assert_eq!(
             env.get("PYTHONPYCACHEPREFIX").unwrap(),
-            &dir.path()
+            &expected_root
                 .join("cache")
                 .join("pycache")
                 .display()
@@ -1816,20 +2111,24 @@ mod tests {
         );
         assert_eq!(
             env.get("TEMP").unwrap(),
-            &dir.path().join("tmp").display().to_string()
+            &expected_root.join("tmp").display().to_string()
         );
         assert_eq!(
             env.get("TMP").unwrap(),
-            &dir.path().join("tmp").display().to_string()
+            &expected_root.join("tmp").display().to_string()
         );
         assert_eq!(env.get("PYTHONNOUSERSITE").unwrap(), "1");
         assert_eq!(
             env.get("CODEX_HOME").unwrap(),
-            &dir.path().join("codex_home").display().to_string()
+            &expected_root.join("codex_home").display().to_string()
         );
         assert_eq!(
             env.get("NPM_CONFIG_CACHE").unwrap(),
-            &dir.path().join("cache").join("npm").display().to_string()
+            &expected_root
+                .join("cache")
+                .join("npm")
+                .display()
+                .to_string()
         );
         assert_eq!(env.get("NPM_CONFIG_UPDATE_NOTIFIER").unwrap(), "false");
     }
@@ -1895,6 +2194,13 @@ mod tests {
             set_env("USBIDE_CODEX_AUTO_INSTALL", "1");
             assert!(app.codex_auto_install_enabled());
             remove_env("USBIDE_CODEX_AUTO_INSTALL");
+            set_env("USBIDE_CODEX_SANDBOX", "workspace-write");
+            set_env("USBIDE_CODEX_APPROVAL", "never");
+            let app2 = App::new(dir.path().to_path_buf()).unwrap();
+            assert_eq!(app2.codex_sandbox_mode, CodexSandboxMode::WorkspaceWrite);
+            assert_eq!(app2.codex_approval_policy, CodexApprovalPolicy::Never);
+            remove_env("USBIDE_CODEX_SANDBOX");
+            remove_env("USBIDE_CODEX_APPROVAL");
         });
     }
 

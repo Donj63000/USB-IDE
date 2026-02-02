@@ -7,11 +7,13 @@ use chrono::Local;
 use eframe::egui::{self, Color32, RichText, ScrollArea, TextEdit};
 
 use crate::codex::{
-    DisplayKind, codex_cli_available, codex_entrypoint_js, codex_env, codex_exec_argv,
-    codex_hint_for_status, codex_install_argv, codex_install_prefix, codex_login_argv,
+    CodexApprovalPolicy, CodexError, CodexSandboxMode, DisplayKind, codex_approval_policy_from_env,
+    codex_cli_available, codex_entrypoint_js, codex_env, codex_exec_argv, codex_hint_for_status,
+    codex_install_argv, codex_install_prefix, codex_login_argv, codex_sandbox_mode_from_env,
     codex_status_argv, extract_display_items, extract_status_code, node_executable,
     parse_tool_list, pip_install_argv, pyinstaller_available, pyinstaller_build_argv,
     pyinstaller_install_argv, resolve_in_path, tools_env, tools_install_prefix,
+    translate_codex_line,
 };
 use crate::fs::{detect_text_encoding, is_probably_binary, read_text_with_encoding};
 use crate::process::{
@@ -20,6 +22,22 @@ use crate::process::{
 
 const APP_NAME: &str = "ValDev Pro v1";
 const LOG_LIMIT: usize = 2000;
+
+fn accent_red() -> Color32 {
+    Color32::from_rgb(229, 57, 53)
+}
+
+fn accent_red_soft() -> Color32 {
+    Color32::from_rgb(178, 45, 45)
+}
+
+fn panel_bg() -> Color32 {
+    Color32::from_rgb(18, 22, 28)
+}
+
+fn panel_border() -> Color32 {
+    Color32::from_rgb(46, 54, 66)
+}
 
 #[derive(Debug, Clone)]
 struct OpenFile {
@@ -193,31 +211,39 @@ pub fn run(root_dir: PathBuf) -> Result<()> {
 
 fn configure_style(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
-    visuals.override_text_color = Some(Color32::from_rgb(230, 230, 230));
-    visuals.window_fill = Color32::from_rgb(18, 20, 24);
-    visuals.panel_fill = Color32::from_rgb(18, 20, 24);
-    visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(22, 24, 28);
-    visuals.widgets.inactive.bg_fill = Color32::from_rgb(28, 32, 38);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(40, 45, 54);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(218, 165, 72);
-    visuals.selection.bg_fill = Color32::from_rgb(218, 165, 72);
-    visuals.selection.stroke.color = Color32::from_rgb(255, 230, 180);
+    visuals.override_text_color = Some(Color32::from_rgb(235, 238, 244));
+    visuals.window_fill = Color32::from_rgb(12, 14, 18);
+    visuals.panel_fill = Color32::from_rgb(14, 18, 24);
+    visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(18, 22, 28);
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(26, 30, 38);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(38, 30, 32);
+    visuals.widgets.active.bg_fill = accent_red();
+    visuals.widgets.noninteractive.rounding = egui::Rounding::same(6.0);
+    visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
+    visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
+    visuals.widgets.active.rounding = egui::Rounding::same(6.0);
+    visuals.selection.bg_fill = accent_red();
+    visuals.selection.stroke.color = Color32::from_rgb(255, 192, 192);
+    visuals.faint_bg_color = Color32::from_rgb(20, 24, 30);
+    visuals.code_bg_color = Color32::from_rgb(16, 20, 26);
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.window_margin = egui::Margin::same(10.0);
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.window_margin = egui::Margin::same(12.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.interact_size = egui::vec2(36.0, 24.0);
     style.text_styles.insert(
         egui::TextStyle::Heading,
-        egui::FontId::new(20.0, egui::FontFamily::Proportional),
+        egui::FontId::new(19.0, egui::FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Body,
-        egui::FontId::new(15.0, egui::FontFamily::Proportional),
+        egui::FontId::new(14.5, egui::FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Monospace,
-        egui::FontId::new(14.0, egui::FontFamily::Monospace),
+        egui::FontId::new(13.5, egui::FontFamily::Monospace),
     );
     ctx.set_style(style);
 }
@@ -236,6 +262,17 @@ struct GuiApp {
     running: Vec<RunningProcess>,
     bug_log_path: PathBuf,
     codex_compact_view: bool,
+    codex_sandbox_mode: CodexSandboxMode,
+    codex_approval_policy: CodexApprovalPolicy,
+    codex_sandbox_supported: Option<bool>,
+    codex_approval_supported: Option<bool>,
+    codex_exec_used_sandbox_flag: bool,
+    codex_exec_used_approval_flag: bool,
+    codex_last_prompt: Option<String>,
+    codex_retry_without_sandbox: bool,
+    codex_retry_without_approval: bool,
+    codex_log_buffer: String,
+    codex_log_dirty: bool,
     last_codex_message: Option<String>,
     codex_assistant_buffer: String,
     codex_install_attempted: bool,
@@ -266,6 +303,17 @@ impl GuiApp {
             running: Vec::new(),
             bug_log_path,
             codex_compact_view: true,
+            codex_sandbox_mode: codex_sandbox_mode_from_env(),
+            codex_approval_policy: codex_approval_policy_from_env(),
+            codex_sandbox_supported: None,
+            codex_approval_supported: None,
+            codex_exec_used_sandbox_flag: false,
+            codex_exec_used_approval_flag: false,
+            codex_last_prompt: None,
+            codex_retry_without_sandbox: false,
+            codex_retry_without_approval: false,
+            codex_log_buffer: String::new(),
+            codex_log_dirty: true,
             last_codex_message: None,
             codex_assistant_buffer: String::new(),
             codex_install_attempted: false,
@@ -278,6 +326,14 @@ impl GuiApp {
         app.log_ui(format!(
             "{APP_NAME}\nRoot: {}\nAstuce: lance la version TUI avec --ui tui si besoin.\n",
             app.root_dir.display()
+        ));
+        app.codex_log_ui(format!(
+            "Sandbox Codex: {}",
+            Self::codex_sandbox_label(app.codex_sandbox_mode)
+        ));
+        app.codex_log_ui(format!(
+            "Approbations Codex: {}",
+            Self::codex_approval_label(app.codex_approval_policy)
         ));
         app
     }
@@ -331,18 +387,63 @@ impl GuiApp {
 
     fn panel_frame(ui: &egui::Ui) -> egui::Frame {
         egui::Frame::group(ui.style())
-            .fill(Color32::from_rgb(20, 22, 26))
-            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(42, 46, 54)))
-            .inner_margin(egui::Margin::same(8.0))
+            .fill(panel_bg())
+            .stroke(egui::Stroke::new(1.0, panel_border()))
+            .rounding(egui::Rounding::same(6.0))
+            .inner_margin(egui::Margin::same(10.0))
+    }
+
+    fn toolbar_group<F: FnOnce(&mut egui::Ui)>(ui: &mut egui::Ui, add: F) {
+        egui::Frame::none()
+            .fill(Color32::from_rgb(20, 24, 30))
+            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(40, 46, 58)))
+            .rounding(egui::Rounding::same(6.0))
+            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                    add(ui);
+                });
+            });
+    }
+
+    fn section_title(ui: &mut egui::Ui, label: &str) {
+        ui.label(
+            RichText::new(label)
+                .strong()
+                .color(Color32::from_rgb(235, 235, 240)),
+        );
     }
 
     fn draw_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&self.title).strong().size(20.0));
+            let title = if self.current.as_ref().map(|f| f.dirty).unwrap_or(false) {
+                format!("{APP_NAME} *")
+            } else {
+                APP_NAME.to_string()
+            };
+            ui.label(
+                RichText::new(title)
+                    .strong()
+                    .size(20.0)
+                    .color(Color32::from_rgb(245, 245, 250)),
+            );
             ui.add_space(8.0);
-            ui.label(RichText::new(&self.sub_title).color(Color32::from_gray(160)));
+            ui.label(
+                RichText::new(&self.sub_title)
+                    .color(Color32::from_gray(150))
+                    .monospace(),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Quitter").clicked() {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Quitter").color(Color32::from_rgb(255, 220, 220)),
+                        )
+                        .fill(accent_red_soft()),
+                    )
+                    .clicked()
+                {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
@@ -351,54 +452,60 @@ impl GuiApp {
         ui.separator();
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Sauver").clicked() {
-                self.action_save();
-            }
-            if ui.button("Executer (F5)").clicked() {
-                self.action_run();
-            }
-            if ui.button("Reload").clicked() {
-                self.action_reload_tree();
-            }
-            if ui.button("Vider logs").clicked() {
-                self.action_clear_log();
-            }
-            ui.separator();
-            if ui.button("Codex login").clicked() {
-                self.action_codex_login();
-            }
-            if ui.button("Codex status").clicked() {
-                self.action_codex_check();
-            }
-            if ui.button("Codex install").clicked() {
-                self.action_codex_install();
-            }
-            let mode_label = if self.codex_compact_view {
-                "Codex: Compact"
-            } else {
-                "Codex: Brut"
-            };
-            if ui.button(mode_label).clicked() {
-                self.action_toggle_codex_view();
-            }
-            ui.separator();
-            if ui.button("Outils dev").clicked() {
-                self.action_dev_tools();
-            }
-            if ui.button("Build EXE").clicked() {
-                self.action_build_exe();
-            }
+            Self::toolbar_group(ui, |ui| {
+                if ui.button("Sauver").clicked() {
+                    self.action_save();
+                }
+                if ui.button("Executer (F5)").clicked() {
+                    self.action_run();
+                }
+                if ui.button("Reload").clicked() {
+                    self.action_reload_tree();
+                }
+                if ui.button("Vider logs").clicked() {
+                    self.action_clear_log();
+                }
+            });
+            Self::toolbar_group(ui, |ui| {
+                if ui.button("Codex login").clicked() {
+                    self.action_codex_login();
+                }
+                if ui.button("Codex status").clicked() {
+                    self.action_codex_check();
+                }
+                if ui.button("Codex install").clicked() {
+                    self.action_codex_install();
+                }
+                let mode_label = if self.codex_compact_view {
+                    "Codex: Compact"
+                } else {
+                    "Codex: Brut"
+                };
+                if ui.button(mode_label).clicked() {
+                    self.action_toggle_codex_view();
+                }
+            });
+            Self::toolbar_group(ui, |ui| {
+                if ui.button("Outils dev").clicked() {
+                    self.action_dev_tools();
+                }
+                if ui.button("Build EXE").clicked() {
+                    self.action_build_exe();
+                }
+            });
         });
     }
 
     fn draw_file_tree(&mut self, ui: &mut egui::Ui) {
         Self::panel_frame(ui).show(ui, |ui| {
-            ui.label(RichText::new("Fichiers").strong());
+            Self::section_title(ui, "Fichiers");
             ui.separator();
             let entries = self.tree.visible.clone();
+            let available_height = ui.available_height();
             ScrollArea::vertical()
                 .id_source("file_tree")
                 .auto_shrink([false, false])
+                .max_height(available_height)
                 .show(ui, |ui| {
                     for entry in entries {
                         let is_selected = self
@@ -445,21 +552,39 @@ impl GuiApp {
         Self::panel_frame(ui).show(ui, |ui| {
             if let Some(current) = &self.current {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Fichier:").strong());
-                    ui.label(current.path.display().to_string());
-                    ui.add_space(16.0);
-                    ui.label(RichText::new("Encodage:").strong());
-                    ui.label(current.encoding.clone());
+                    Self::section_title(ui, "Editeur");
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(current.path.display().to_string())
+                            .color(Color32::from_gray(180)),
+                    );
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(current.encoding.clone()).color(Color32::from_gray(150)),
+                    );
                     if current.dirty {
-                        ui.add_space(12.0);
-                        ui.colored_label(Color32::from_rgb(218, 165, 72), "modifie");
+                        ui.add_space(10.0);
+                        ui.colored_label(accent_red(), "modifie");
                     }
                 });
                 ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                let available = ui.available_size();
                 let editor = TextEdit::multiline(&mut self.editor_text)
                     .code_editor()
-                    .desired_width(f32::INFINITY);
-                let response = ui.add_sized(ui.available_size(), editor);
+                    .desired_width(f32::INFINITY)
+                    .lock_focus(true);
+                let response = ScrollArea::both()
+                    .id_source("editor_scroll")
+                    .auto_shrink([false, false])
+                    .max_height(available.y)
+                    .max_width(available.x)
+                    .show(ui, |ui| {
+                        ui.set_min_size(available);
+                        ui.add_sized(available, editor)
+                    })
+                    .inner;
                 if response.changed() {
                     if let Some(current) = self.current.as_mut() {
                         current.dirty = true;
@@ -470,7 +595,10 @@ impl GuiApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
                     ui.label(RichText::new("Aucun fichier ouvert.").heading());
-                    ui.label("Clique un fichier a gauche pour l'ouvrir.");
+                    ui.label(
+                        RichText::new("Clique un fichier a gauche pour l'ouvrir.")
+                            .color(Color32::from_gray(160)),
+                    );
                 });
             }
         });
@@ -506,7 +634,7 @@ impl GuiApp {
 
     fn draw_command_panel(&mut self, ui: &mut egui::Ui) {
         Self::panel_frame(ui).show(ui, |ui| {
-            ui.label(RichText::new("Commande").strong());
+            Self::section_title(ui, "Commande");
             ui.add_space(6.0);
             let mut submit = false;
             ui.horizontal(|ui| {
@@ -533,13 +661,16 @@ impl GuiApp {
                 self.run_shell(cmd);
             }
             ui.add_space(8.0);
-            self.draw_logs(ui, LogTarget::Main, "log_main");
+            let log_height = ui.available_height().max(80.0);
+            ui.allocate_ui(egui::vec2(ui.available_width(), log_height), |ui| {
+                self.draw_logs(ui, LogTarget::Main, "log_main");
+            });
         });
     }
 
     fn draw_codex_panel(&mut self, ui: &mut egui::Ui) {
         Self::panel_frame(ui).show(ui, |ui| {
-            ui.label(RichText::new("Codex").strong());
+            Self::section_title(ui, "Codex");
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Login").clicked() {
@@ -558,6 +689,23 @@ impl GuiApp {
                 };
                 if ui.button(label).clicked() {
                     self.action_toggle_codex_view();
+                }
+            });
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                let sandbox_label = format!(
+                    "Sandbox: {}",
+                    Self::codex_sandbox_label(self.codex_sandbox_mode)
+                );
+                if ui.button(sandbox_label).clicked() {
+                    self.action_toggle_codex_sandbox();
+                }
+                let approval_label = format!(
+                    "Approvals: {}",
+                    Self::codex_approval_label(self.codex_approval_policy)
+                );
+                if ui.button(approval_label).clicked() {
+                    self.action_toggle_codex_approval();
                 }
             });
             ui.add_space(4.0);
@@ -587,8 +735,40 @@ impl GuiApp {
                 self.run_codex(prompt);
             }
             ui.add_space(8.0);
-            self.draw_logs(ui, LogTarget::Codex, "log_codex");
+            let log_height = ui.available_height().max(80.0);
+            ui.allocate_ui(egui::vec2(ui.available_width(), log_height), |ui| {
+                self.draw_codex_log(ui);
+            });
         });
+    }
+
+    fn draw_codex_log(&mut self, ui: &mut egui::Ui) {
+        if self.codex_log_dirty {
+            self.codex_log_buffer = self.render_plain_log(&self.codex_log);
+            self.codex_log_dirty = false;
+        }
+        let available = ui.available_size();
+        let response = ui.add_sized(
+            available,
+            TextEdit::multiline(&mut self.codex_log_buffer)
+                .desired_width(f32::INFINITY)
+                .lock_focus(true),
+        );
+        if response.changed() {
+            self.codex_log_buffer = self.render_plain_log(&self.codex_log);
+            self.codex_log_dirty = false;
+        }
+    }
+
+    fn render_plain_log(&self, entries: &[LogLine]) -> String {
+        let mut out = String::new();
+        for (idx, entry) in entries.iter().enumerate() {
+            out.push_str(&entry.text);
+            if idx + 1 < entries.len() {
+                out.push('\n');
+            }
+        }
+        out
     }
 
     fn refresh_title(&mut self) {
@@ -614,6 +794,9 @@ impl GuiApp {
         if store.len() > LOG_LIMIT {
             let drain = store.len() - LOG_LIMIT;
             store.drain(0..drain);
+        }
+        if matches!(target, LogTarget::Codex) {
+            self.codex_log_dirty = true;
         }
     }
 
@@ -749,6 +932,27 @@ impl GuiApp {
         env_map = self.portable_env(env_map);
         self.sanitize_codex_env(&mut env_map);
         codex_env(&self.root_dir, Some(&env_map))
+    }
+
+    fn ensure_node_available(
+        &mut self,
+        env_map: &HashMap<String, String>,
+        target: LogTarget,
+    ) -> bool {
+        if node_executable(&self.root_dir, Some(env_map)).is_some() {
+            return true;
+        }
+        let expected = self.root_dir.join("tools").join("node");
+        self.log_issue(
+            &format!(
+                "Node portable introuvable. Place node dans {} (ex: node.exe) ou ajoute node au PATH.",
+                expected.display()
+            ),
+            "erreur",
+            "node",
+            target,
+        );
+        false
     }
 
     fn tools_env(&self) -> HashMap<String, String> {
@@ -944,6 +1148,7 @@ impl GuiApp {
         self.log.clear();
         self.codex_log.clear();
         self.last_codex_message = None;
+        self.codex_log_dirty = true;
         self.log_ui("journaux effaces".to_string());
     }
 
@@ -963,20 +1168,133 @@ impl GuiApp {
         self.codex_log_ui(format!("Mode Codex: {mode}"));
     }
 
+    fn action_toggle_codex_sandbox(&mut self) {
+        self.codex_sandbox_mode = Self::next_codex_sandbox_mode(self.codex_sandbox_mode);
+        self.codex_log_ui(format!(
+            "Sandbox Codex: {}",
+            Self::codex_sandbox_label(self.codex_sandbox_mode)
+        ));
+    }
+
+    fn action_toggle_codex_approval(&mut self) {
+        self.codex_approval_policy = Self::next_codex_approval_policy(self.codex_approval_policy);
+        self.codex_log_ui(format!(
+            "Approbations Codex: {}",
+            Self::codex_approval_label(self.codex_approval_policy)
+        ));
+    }
+
     fn action_codex_install(&mut self) {
         let _ = self.install_codex(true, LogTarget::Codex);
+    }
+
+    fn codex_exec_extra_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.codex_sandbox_supported != Some(false) {
+            args.push("--sandbox".to_string());
+            args.push(self.codex_sandbox_mode.as_str().to_string());
+        }
+        if self.codex_approval_supported != Some(false) {
+            args.push("--ask-for-approval".to_string());
+            args.push(self.codex_approval_policy.as_str().to_string());
+        }
+        args
+    }
+
+    fn codex_sandbox_label(mode: CodexSandboxMode) -> &'static str {
+        match mode {
+            CodexSandboxMode::ReadOnly => "lecture seule",
+            CodexSandboxMode::WorkspaceWrite => "agent (workspace)",
+            CodexSandboxMode::DangerFullAccess => "danger (acces complet)",
+        }
+    }
+
+    fn codex_approval_label(policy: CodexApprovalPolicy) -> &'static str {
+        match policy {
+            CodexApprovalPolicy::Untrusted => "non fiable",
+            CodexApprovalPolicy::OnFailure => "sur echec",
+            CodexApprovalPolicy::OnRequest => "sur demande",
+            CodexApprovalPolicy::Never => "jamais",
+        }
+    }
+
+    fn next_codex_sandbox_mode(mode: CodexSandboxMode) -> CodexSandboxMode {
+        match mode {
+            CodexSandboxMode::ReadOnly => CodexSandboxMode::WorkspaceWrite,
+            CodexSandboxMode::WorkspaceWrite => CodexSandboxMode::DangerFullAccess,
+            CodexSandboxMode::DangerFullAccess => CodexSandboxMode::ReadOnly,
+        }
+    }
+
+    fn next_codex_approval_policy(policy: CodexApprovalPolicy) -> CodexApprovalPolicy {
+        match policy {
+            CodexApprovalPolicy::OnRequest => CodexApprovalPolicy::OnFailure,
+            CodexApprovalPolicy::OnFailure => CodexApprovalPolicy::Untrusted,
+            CodexApprovalPolicy::Untrusted => CodexApprovalPolicy::Never,
+            CodexApprovalPolicy::Never => CodexApprovalPolicy::OnRequest,
+        }
+    }
+
+    fn approval_flag_error(line: &str) -> bool {
+        let lower = line.to_lowercase();
+        lower.contains("--ask-for-approval")
+            && (lower.contains("unexpected argument")
+                || lower.contains("unknown argument")
+                || lower.contains("unrecognized"))
+    }
+
+    fn sandbox_flag_error(line: &str) -> bool {
+        let lower = line.to_lowercase();
+        lower.contains("--sandbox")
+            && (lower.contains("unexpected argument")
+                || lower.contains("unknown argument")
+                || lower.contains("unrecognized"))
+    }
+
+    fn sandbox_value_error(line: &str) -> bool {
+        let lower = line.to_lowercase();
+        lower.contains("--sandbox")
+            && (lower.contains("invalid value") || lower.contains("possible values"))
+    }
+
+    fn handle_approval_flag_line(&mut self, line: &str) -> bool {
+        if !self.codex_exec_used_approval_flag || !Self::approval_flag_error(line) {
+            return false;
+        }
+        if self.codex_approval_supported != Some(false) {
+            self.codex_approval_supported = Some(false);
+            self.codex_log_action(
+                "Option --ask-for-approval non supportee par cette version Codex. Relance sans approbations.",
+            );
+        }
+        self.codex_retry_without_approval = true;
+        true
+    }
+
+    fn handle_sandbox_flag_line(&mut self, line: &str) -> bool {
+        if !self.codex_exec_used_sandbox_flag {
+            return false;
+        }
+        if Self::sandbox_flag_error(line) || Self::sandbox_value_error(line) {
+            if self.codex_sandbox_supported != Some(false) {
+                self.codex_sandbox_supported = Some(false);
+                self.codex_log_action(
+                    "Option --sandbox non supportee par cette version Codex. Relance sans sandbox (mode par defaut).",
+                );
+            }
+            self.codex_retry_without_sandbox = true;
+            return true;
+        }
+        false
     }
 
     fn action_codex_login(&mut self) {
         let env_map = self.codex_env();
         if !codex_cli_available(Some(&self.root_dir), Some(&env_map)) {
+            if !self.ensure_node_available(&env_map, LogTarget::Codex) {
+                return;
+            }
             if !self.install_codex(false, LogTarget::Codex) {
-                self.log_issue(
-                    "Codex introuvable.",
-                    "erreur",
-                    "codex_login",
-                    LogTarget::Codex,
-                );
                 return;
             }
         }
@@ -1005,6 +1323,9 @@ impl GuiApp {
     fn action_codex_check(&mut self) {
         let env_map = self.codex_env();
         if !codex_cli_available(Some(&self.root_dir), Some(&env_map)) {
+            if !self.ensure_node_available(&env_map, LogTarget::Codex) {
+                return;
+            }
             self.log_issue(
                 "Codex non installe.",
                 "avertissement",
@@ -1224,24 +1545,62 @@ impl GuiApp {
             return true;
         }
         if !force && self.codex_install_attempted {
-            return false;
-        }
-        if !force && !self.codex_auto_install_enabled() {
             self.log_issue(
-                "Auto-install Codex desactive.",
+                "Installation Codex deja tentee. (bouton Installer pour forcer)",
                 "avertissement",
                 "installation_codex",
                 target,
             );
             return false;
         }
+        if !force && !self.codex_auto_install_enabled() {
+            self.log_issue(
+                "Auto-install Codex desactive. (bouton Installer)",
+                "avertissement",
+                "installation_codex",
+                target,
+            );
+            return false;
+        }
+        if !self.ensure_node_available(&env_map, target) {
+            return false;
+        }
         self.codex_install_attempted = true;
         let package = std::env::var("USBIDE_CODEX_NPM_PACKAGE")
             .unwrap_or_else(|_| "@openai/codex".to_string());
         let prefix = codex_install_prefix(&self.root_dir);
-        let _ = std::fs::create_dir_all(&prefix);
+        if let Err(err) = std::fs::create_dir_all(&prefix) {
+            self.log_issue(
+                &format!(
+                    "Impossible de creer le dossier d'installation Codex: {} ({err})",
+                    prefix.display()
+                ),
+                "erreur",
+                "installation_codex",
+                target,
+            );
+            return false;
+        }
         let argv = match codex_install_argv(&self.root_dir, &prefix, &package) {
             Ok(argv) => argv,
+            Err(CodexError::NodeMissing) => {
+                self.log_issue(
+                    "Node portable introuvable. Place node dans tools/node (ex: node.exe) ou ajoute node au PATH.",
+                    "erreur",
+                    "installation_codex",
+                    target,
+                );
+                return false;
+            }
+            Err(CodexError::NpmMissing) => {
+                self.log_issue(
+                    "npm-cli.js introuvable. Verifie ton Node portable (npm inclus).",
+                    "erreur",
+                    "installation_codex",
+                    target,
+                );
+                return false;
+            }
             Err(err) => {
                 self.log_issue(
                     &format!("Impossible d'installer Codex: {err}"),
@@ -1300,16 +1659,11 @@ impl GuiApp {
         }
         let env_map = self.codex_env();
         if !codex_cli_available(Some(&self.root_dir), Some(&env_map)) {
-            let installed = self.install_codex(false, LogTarget::Codex);
-            if installed {
+            if !self.ensure_node_available(&env_map, LogTarget::Codex) {
+                return;
+            }
+            if self.install_codex(false, LogTarget::Codex) {
                 self.pending_codex_prompt = Some(prompt);
-            } else {
-                self.log_issue(
-                    "Codex indisponible. (installe via bouton)",
-                    "erreur",
-                    "codex_exec",
-                    LogTarget::Codex,
-                );
             }
             return;
         }
@@ -1406,12 +1760,18 @@ impl GuiApp {
                 if let Some(prompt) = self.pending_codex_prompt.take() {
                     if code == Some(0) {
                         let env_map = self.codex_env();
+                        let extra_args = self.codex_exec_extra_args();
+                        self.codex_exec_used_sandbox_flag =
+                            extra_args.iter().any(|arg| arg == "--sandbox");
+                        self.codex_exec_used_approval_flag =
+                            extra_args.iter().any(|arg| arg == "--ask-for-approval");
+                        self.codex_last_prompt = Some(prompt.clone());
                         match codex_exec_argv(
                             &prompt,
                             Some(&self.root_dir),
                             Some(&env_map),
                             true,
-                            None,
+                            Some(&extra_args),
                         ) {
                             Ok(argv) => {
                                 if !self.codex_compact_view {
@@ -1435,8 +1795,15 @@ impl GuiApp {
                             }
                         }
                     } else {
-                        self.codex_log_action("Codex n'est pas authentifie dans ce CODEX_HOME.");
-                        self.codex_log_action("Fais Login puis recommence.");
+                        self.codex_log_action(
+                            "Echec de la verification du login Codex (status en erreur).",
+                        );
+                        self.codex_log_action(
+                            "Si tu n'es pas authentifie, fais Login puis recommence.",
+                        );
+                        self.codex_log_action(
+                            "Si tu es deja authentifie, verifie l'installation et la connexion.",
+                        );
                         if !self.codex_device_auth_enabled() {
                             self.codex_log_action(
                                 "Astuce: si le navigateur ne s'ouvre pas, definis USBIDE_CODEX_DEVICE_AUTH=1.",
@@ -1449,6 +1816,34 @@ impl GuiApp {
                 if self.codex_compact_view && !self.codex_assistant_buffer.is_empty() {
                     let message = std::mem::take(&mut self.codex_assistant_buffer);
                     self.codex_log_message(&message);
+                }
+                if self.codex_retry_without_sandbox || self.codex_retry_without_approval {
+                    self.codex_retry_without_sandbox = false;
+                    self.codex_retry_without_approval = false;
+                    if let Some(prompt) = self.codex_last_prompt.clone() {
+                        let env_map = self.codex_env();
+                        let extra_args = self.codex_exec_extra_args();
+                        self.codex_exec_used_sandbox_flag =
+                            extra_args.iter().any(|arg| arg == "--sandbox");
+                        self.codex_exec_used_approval_flag =
+                            extra_args.iter().any(|arg| arg == "--ask-for-approval");
+                        if let Ok(argv) = codex_exec_argv(
+                            &prompt,
+                            Some(&self.root_dir),
+                            Some(&env_map),
+                            true,
+                            Some(&extra_args),
+                        ) {
+                            self.codex_log_ui(format!("$ {}", argv.join(" ")));
+                            self.spawn_process(
+                                argv,
+                                env_map,
+                                "codex_exec",
+                                LogTarget::Codex,
+                                ProcessKind::CodexExec,
+                            );
+                        }
+                    }
                 }
             }
             ProcessKind::CodexInstall => {
@@ -1467,6 +1862,20 @@ impl GuiApp {
     fn handle_codex_line(&mut self, line: &str) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            return;
+        }
+        if self.handle_sandbox_flag_line(trimmed) || self.handle_approval_flag_line(trimmed) {
+            return;
+        }
+        if self.codex_retry_without_sandbox || self.codex_retry_without_approval {
+            return;
+        }
+        if let Some(translated) = translate_codex_line(trimmed) {
+            if self.codex_compact_view {
+                self.codex_log_action(&translated);
+            } else {
+                self.codex_log_ui(translated);
+            }
             return;
         }
 
@@ -1519,16 +1928,20 @@ impl GuiApp {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             if self.codex_compact_view {
-                if let Some(status) = extract_status_code(msg) {
-                    self.codex_log_action(&format!("Erreur Codex HTTP {status}: {msg}"));
+                if let Some(translated) = translate_codex_line(msg) {
+                    self.codex_log_action(&translated);
+                } else if let Some(status) = extract_status_code(msg) {
+                    self.codex_log_action(&format!("Erreur Codex HTTP {status}."));
                     if let Some(hint) = codex_hint_for_status(status) {
                         self.codex_log_action(&hint);
                     }
                 } else {
-                    self.codex_log_action(&format!("Erreur Codex: {msg}"));
+                    self.codex_log_action(
+                        "Erreur Codex: une erreur est survenue. Consulte le journal ou relance.",
+                    );
                 }
             } else {
-                self.codex_log_ui(format!("Erreur Codex: {msg}"));
+                self.codex_log_ui("Erreur Codex: une erreur est survenue.".to_string());
             }
             return;
         }
@@ -1540,16 +1953,18 @@ impl GuiApp {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             if self.codex_compact_view {
-                if let Some(status) = extract_status_code(msg) {
-                    self.codex_log_action(&format!("Task echouee HTTP {status}: {msg}"));
+                if let Some(translated) = translate_codex_line(msg) {
+                    self.codex_log_action(&translated);
+                } else if let Some(status) = extract_status_code(msg) {
+                    self.codex_log_action(&format!("Tache echouee HTTP {status}."));
                     if let Some(hint) = codex_hint_for_status(status) {
                         self.codex_log_action(&hint);
                     }
                 } else {
-                    self.codex_log_action(&format!("Task echouee: {msg}"));
+                    self.codex_log_action("Tache echouee: une erreur est survenue.");
                 }
             } else {
-                self.codex_log_ui(format!("Task echouee: {msg}"));
+                self.codex_log_ui("Tache echouee.".to_string());
             }
             return;
         }
@@ -1616,8 +2031,15 @@ impl eframe::App for GuiApp {
 
         egui::TopBottomPanel::bottom("bottom")
             .resizable(true)
-            .default_height(300.0)
+            .default_height({
+                let h = ctx.input(|i| i.screen_rect().height());
+                (h * 0.30).clamp(240.0, 360.0)
+            })
             .min_height(220.0)
+            .max_height({
+                let h = ctx.input(|i| i.screen_rect().height());
+                (h * 0.45).clamp(280.0, 480.0)
+            })
             .show(ctx, |ui| {
                 let height = ui.available_height();
                 ui.columns(2, |columns| {

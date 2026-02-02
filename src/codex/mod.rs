@@ -24,6 +24,127 @@ pub enum CodexError {
     NpmMissing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexSandboxMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl CodexSandboxMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CodexSandboxMode::ReadOnly => "read-only",
+            CodexSandboxMode::WorkspaceWrite => "workspace-write",
+            CodexSandboxMode::DangerFullAccess => "danger-full-access",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexApprovalPolicy {
+    Untrusted,
+    OnFailure,
+    OnRequest,
+    Never,
+}
+
+impl CodexApprovalPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CodexApprovalPolicy::Untrusted => "untrusted",
+            CodexApprovalPolicy::OnFailure => "on-failure",
+            CodexApprovalPolicy::OnRequest => "on-request",
+            CodexApprovalPolicy::Never => "never",
+        }
+    }
+}
+
+pub fn parse_codex_sandbox_mode(value: &str) -> Option<CodexSandboxMode> {
+    match value.trim().to_lowercase().as_str() {
+        "read-only" | "readonly" | "ro" => Some(CodexSandboxMode::ReadOnly),
+        "workspace-write" | "workspace" | "write" | "agent" => {
+            Some(CodexSandboxMode::WorkspaceWrite)
+        }
+        "danger-full-access" | "danger" | "full" | "full-access" => {
+            Some(CodexSandboxMode::DangerFullAccess)
+        }
+        _ => None,
+    }
+}
+
+pub fn parse_codex_approval_policy(value: &str) -> Option<CodexApprovalPolicy> {
+    match value.trim().to_lowercase().as_str() {
+        "untrusted" => Some(CodexApprovalPolicy::Untrusted),
+        "on-failure" | "onfailure" => Some(CodexApprovalPolicy::OnFailure),
+        "on-request" | "onrequest" => Some(CodexApprovalPolicy::OnRequest),
+        "never" | "none" | "off" => Some(CodexApprovalPolicy::Never),
+        _ => None,
+    }
+}
+
+pub fn codex_sandbox_mode_from_env() -> CodexSandboxMode {
+    env::var("USBIDE_CODEX_SANDBOX")
+        .ok()
+        .and_then(|v| parse_codex_sandbox_mode(&v))
+        .unwrap_or(CodexSandboxMode::WorkspaceWrite)
+}
+
+pub fn codex_approval_policy_from_env() -> CodexApprovalPolicy {
+    env::var("USBIDE_CODEX_APPROVAL")
+        .ok()
+        .and_then(|v| parse_codex_approval_policy(&v))
+        .unwrap_or(CodexApprovalPolicy::Never)
+}
+
+pub fn translate_codex_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_lowercase();
+    if lower.contains("--ask-for-approval")
+        && (lower.contains("unexpected argument")
+            || lower.contains("unknown argument")
+            || lower.contains("unrecognized"))
+    {
+        return Some(
+            "Erreur : l'option --ask-for-approval n'est pas reconnue par cette version de Codex."
+                .to_string(),
+        );
+    }
+    if lower.starts_with("tip:") && lower.contains("--ask-for-approval") {
+        return Some(
+            "Astuce : pour passer --ask-for-approval comme valeur, utilise -- --ask-for-approval."
+                .to_string(),
+        );
+    }
+    if lower.starts_with("usage: codex exec") {
+        return Some(
+            "Utilisation : codex exec --json --sandbox <MODE_SANDBOX> [PROMPT].".to_string(),
+        );
+    }
+    if lower.starts_with("for more information") || lower.contains("try '--help'") {
+        return Some("Pour plus d'information, utilise --help.".to_string());
+    }
+    if lower.starts_with("error:") {
+        if lower.contains("unexpected argument")
+            || lower.contains("unknown argument")
+            || lower.contains("unrecognized")
+        {
+            return Some("Erreur : option inconnue ou invalide. Consulte --help.".to_string());
+        }
+        return Some("Erreur : commande Codex invalide. Consulte --help.".to_string());
+    }
+    if lower.starts_with("logged in using") {
+        return Some("Connecte avec ChatGPT.".to_string());
+    }
+    if lower.starts_with("up to date in") {
+        return Some("A jour.".to_string());
+    }
+    None
+}
+
 fn is_windows() -> bool {
     cfg!(windows)
 }
@@ -94,9 +215,43 @@ fn find_in_path(cmd: &str, path: Option<&str>, is_windows: bool) -> Option<PathB
     None
 }
 
+fn env_value_from_map(
+    env_map: Option<&HashMap<String, String>>,
+    key: &str,
+    is_windows: bool,
+) -> Option<String> {
+    env_map.and_then(|env| {
+        env.get(key).cloned().or_else(|| {
+            if is_windows {
+                env.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .map(|(_, v)| v.clone())
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn env_path_from_map(
+    env_map: Option<&HashMap<String, String>>,
+    is_windows: bool,
+) -> Option<String> {
+    env_value_from_map(env_map, "PATH", is_windows)
+}
+
 pub fn resolve_in_path(cmd: &str, env_map: &HashMap<String, String>) -> Option<PathBuf> {
-    let path_value = env_map.get("PATH").map(String::as_str);
-    find_in_path(cmd, path_value, is_windows())
+    let path_value = env_map.get("PATH").cloned().or_else(|| {
+        if is_windows() {
+            env_map
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+                .map(|(_, v)| v.clone())
+        } else {
+            None
+        }
+    });
+    find_in_path(cmd, path_value.as_deref(), is_windows())
 }
 
 // =============================================================================
@@ -120,6 +275,7 @@ pub fn tools_env(
     base_env: Option<&HashMap<String, String>>,
 ) -> HashMap<String, String> {
     let mut env_map = base_env.cloned().unwrap_or_else(|| env::vars().collect());
+    normalize_path_key(&mut env_map);
     let bin_dir = python_scripts_dir(&tools_install_prefix(root_dir));
     prepend_path(&mut env_map, &bin_dir);
     env_map
@@ -276,7 +432,7 @@ fn node_executable_with_os(
     }
 
     let path_value = env_map
-        .and_then(|env| env.get("PATH").cloned())
+        .and_then(|env| env_path_from_map(Some(env), is_windows))
         .or_else(|| env::var("PATH").ok());
 
     if let Some(path) = path_value.as_deref() {
@@ -339,8 +495,13 @@ pub fn codex_env(
     base_env: Option<&HashMap<String, String>>,
 ) -> HashMap<String, String> {
     let mut env_map = base_env.cloned().unwrap_or_else(|| env::vars().collect());
+    normalize_path_key(&mut env_map);
     let node_dir = node_tools_dir(root_dir);
+    let node_bin = node_dir.join("bin");
     let bin_dir = codex_bin_dir(&codex_install_prefix(root_dir));
+    if node_bin.exists() {
+        prepend_path(&mut env_map, &node_bin);
+    }
     prepend_path(&mut env_map, &node_dir);
     prepend_path(&mut env_map, &bin_dir);
     env_map
@@ -381,6 +542,18 @@ pub fn codex_entrypoint_js(prefix: &Path) -> Option<PathBuf> {
     if entry.exists() { Some(entry) } else { None }
 }
 
+fn codex_path_needs_node(path: &Path, is_windows: bool) -> bool {
+    if !is_windows {
+        return false;
+    }
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    matches!(ext.as_str(), "cmd" | "bat" | "ps1")
+}
+
 pub fn codex_cli_available(
     root_dir: Option<&Path>,
     env_map: Option<&HashMap<String, String>>,
@@ -398,7 +571,17 @@ pub fn codex_cli_available(
         env_map.cloned().unwrap_or_else(|| env::vars().collect())
     };
     let path_value = search_env.get("PATH").map(String::as_str);
-    find_in_path("codex", path_value, is_windows()).is_some()
+    let resolved = find_in_path("codex", path_value, is_windows());
+    if let Some(resolved) = resolved {
+        if codex_path_needs_node(&resolved, is_windows()) {
+            if let Some(root) = root_dir {
+                return node_executable(root, Some(&search_env)).is_some();
+            }
+            return find_in_path("node", path_value, is_windows()).is_some();
+        }
+        return true;
+    }
+    false
 }
 
 fn codex_base_argv_with_os(
@@ -415,9 +598,7 @@ fn codex_base_argv_with_os(
     }
 
     if is_windows {
-        let search_path = env_map
-            .and_then(|env| env.get("PATH").cloned())
-            .or_else(|| env::var("PATH").ok());
+        let search_path = env_path_from_map(env_map, is_windows).or_else(|| env::var("PATH").ok());
         let resolved = find_in_path("codex", search_path.as_deref(), is_windows);
         if let Some(resolved) = resolved {
             let suffix = resolved
@@ -426,8 +607,7 @@ fn codex_base_argv_with_os(
                 .unwrap_or_default()
                 .to_lowercase();
             if suffix == "cmd" || suffix == "bat" {
-                let comspec = env_map
-                    .and_then(|env| env.get("COMSPEC").cloned())
+                let comspec = env_value_from_map(env_map, "COMSPEC", is_windows)
                     .or_else(|| env::var("COMSPEC").ok())
                     .unwrap_or_else(|| "cmd.exe".to_string());
                 return vec![
@@ -502,6 +682,10 @@ pub fn codex_exec_argv(
             }
         }
     }
+    let trimmed_prompt = prompt.trim_start();
+    if trimmed_prompt.starts_with('-') {
+        argv.push("--".to_string());
+    }
     argv.push(prompt.to_string());
     Ok(argv)
 }
@@ -516,7 +700,6 @@ pub fn codex_install_argv(
     }
     let node = node_executable(root_dir, None).ok_or(CodexError::NodeMissing)?;
     let npm = npm_cli_js(root_dir, Some(&node)).ok_or(CodexError::NpmMissing)?;
-    let _ = std::fs::create_dir_all(prefix);
     Ok(vec![
         path_for_cmd(&node),
         path_for_cmd(&npm),
@@ -530,6 +713,7 @@ pub fn codex_install_argv(
 }
 
 fn prepend_path(env_map: &mut HashMap<String, String>, path: &Path) {
+    normalize_path_key(env_map);
     let path_str = path.to_string_lossy();
     let current = env_map.get("PATH").cloned().unwrap_or_default();
     let mut paths: Vec<PathBuf> = env::split_paths(&current).collect();
@@ -543,6 +727,26 @@ fn prepend_path(env_map: &mut HashMap<String, String>, path: &Path) {
     } else {
         let sep = if is_windows() { ";" } else { ":" };
         env_map.insert("PATH".to_string(), format!("{path_str}{sep}{current}"));
+    }
+}
+
+fn normalize_path_key(env_map: &mut HashMap<String, String>) {
+    if !is_windows() {
+        return;
+    }
+    if env_map.contains_key("PATH") {
+        return;
+    }
+    let mut found: Option<(String, String)> = None;
+    for (key, value) in env_map.iter() {
+        if key.eq_ignore_ascii_case("PATH") {
+            found = Some((key.clone(), value.clone()));
+            break;
+        }
+    }
+    if let Some((key, value)) = found {
+        env_map.remove(&key);
+        env_map.insert("PATH".to_string(), value);
     }
 }
 
@@ -564,11 +768,11 @@ pub struct DisplayItem {
 }
 
 pub fn extract_status_code(msg: &str) -> Option<u16> {
-    let re = Regex::new(r"(?i)(?:unexpected status|last status[: ]+)\\s*(\\d{3})").ok()?;
+    let re = Regex::new(r"(?i)(?:unexpected status|last status[: ]+)\s*(\d{3})").ok()?;
     if let Some(cap) = re.captures(msg) {
         return cap.get(1).and_then(|m| m.as_str().parse::<u16>().ok());
     }
-    let re_any = Regex::new(r"\\b(\\d{3})\\b").ok()?;
+    let re_any = Regex::new(r"\b(\d{3})\b").ok()?;
     re_any
         .captures(msg)
         .and_then(|cap| cap.get(1))
@@ -1018,7 +1222,9 @@ mod tests {
 
     #[test]
     fn codex_login_argv_default() {
-        let argv = codex_login_argv(None, None, false);
+        let mut env_map = HashMap::new();
+        env_map.insert("PATH".to_string(), String::new());
+        let argv = codex_login_argv(None, Some(&env_map), false);
         assert_eq!(argv[0], "codex");
         assert_eq!(&argv[1..], ["login"]);
     }
@@ -1031,7 +1237,9 @@ mod tests {
 
     #[test]
     fn codex_status_argv_default() {
-        let argv = codex_status_argv(None, None);
+        let mut env_map = HashMap::new();
+        env_map.insert("PATH".to_string(), String::new());
+        let argv = codex_status_argv(None, Some(&env_map));
         assert_eq!(argv[0], "codex");
         assert_eq!(&argv[1..], ["login", "status"]);
     }
@@ -1039,12 +1247,23 @@ mod tests {
     #[test]
     fn codex_exec_argv_json() {
         let extra = vec!["--model".to_string(), "gpt-5".to_string()];
-        let argv = codex_exec_argv("hello", None, None, true, Some(&extra)).unwrap();
+        let mut env_map = HashMap::new();
+        env_map.insert("PATH".to_string(), String::new());
+        let argv = codex_exec_argv("hello", None, Some(&env_map), true, Some(&extra)).unwrap();
         assert_eq!(argv[0], "codex");
         assert!(argv.contains(&"--json".to_string()));
         assert!(argv.contains(&"--model".to_string()));
         assert!(argv.contains(&"gpt-5".to_string()));
         assert_eq!(argv.last().unwrap(), "hello");
+    }
+
+    #[test]
+    fn codex_exec_argv_prompt_commence_par_tiret() {
+        let mut env_map = HashMap::new();
+        env_map.insert("PATH".to_string(), String::new());
+        let argv = codex_exec_argv("--help", None, Some(&env_map), true, None).unwrap();
+        let pos = argv.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(argv[pos + 1], "--help");
     }
 
     #[test]
@@ -1055,7 +1274,11 @@ mod tests {
         let entry_path = create_codex_package(&codex_install_prefix(root));
         let argv = codex_exec_argv("hello", Some(root), None, true, None).unwrap();
         assert_eq!(argv[0], node_path.to_string_lossy());
-        assert_eq!(argv[1], entry_path.to_string_lossy());
+        let argv_entry = Path::new(&argv[1]);
+        assert_eq!(
+            argv_entry.components().collect::<Vec<_>>(),
+            entry_path.components().collect::<Vec<_>>()
+        );
         assert!(argv.contains(&"exec".to_string()));
     }
 
@@ -1072,7 +1295,10 @@ mod tests {
         let argv = codex_base_argv_with_os(None, Some(&env_map), true);
         assert_eq!(argv[0], "cmd.exe");
         assert!(argv.contains(&"/c".to_string()));
-        assert!(argv.iter().any(|arg| arg.ends_with("codex.cmd")));
+        assert!(
+            argv.iter()
+                .any(|arg| arg.to_lowercase().ends_with("codex.cmd"))
+        );
     }
 
     #[test]
@@ -1105,10 +1331,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let bin_dir = dir.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        let codex_bin = bin_dir.join("codex");
-        fs::write(&codex_bin, "").unwrap();
         let mut env_map = HashMap::new();
         env_map.insert("PATH".to_string(), bin_dir.to_string_lossy().to_string());
+        if cfg!(windows) {
+            let codex_bin = bin_dir.join("codex.cmd");
+            fs::write(&codex_bin, "").unwrap();
+            let node_bin = bin_dir.join("node.exe");
+            fs::write(&node_bin, "").unwrap();
+        } else {
+            let codex_bin = bin_dir.join("codex");
+            fs::write(&codex_bin, "").unwrap();
+        }
         assert!(codex_cli_available(None, Some(&env_map)));
     }
 
@@ -1119,6 +1352,22 @@ mod tests {
         create_portable_node(root);
         create_codex_package(&codex_install_prefix(root));
         assert!(codex_cli_available(Some(root), None));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn codex_cli_available_cmd_requires_node() {
+        let dir = TempDir::new().unwrap();
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let shim = bin_dir.join("codex.cmd");
+        fs::write(&shim, "").unwrap();
+        let mut env_map = HashMap::new();
+        env_map.insert("PATH".to_string(), bin_dir.to_string_lossy().to_string());
+        assert!(!codex_cli_available(None, Some(&env_map)));
+        let node = bin_dir.join("node.exe");
+        fs::write(&node, "").unwrap();
+        assert!(codex_cli_available(None, Some(&env_map)));
     }
 
     #[test]
@@ -1173,6 +1422,74 @@ mod tests {
     fn parse_tool_list_ok() {
         let tools = parse_tool_list("ruff, black  mypy, pytest ruff");
         assert_eq!(tools, vec!["ruff", "black", "mypy", "pytest"]);
+    }
+
+    #[test]
+    fn parse_codex_sandbox_mode_ok() {
+        assert_eq!(
+            parse_codex_sandbox_mode("read-only"),
+            Some(CodexSandboxMode::ReadOnly)
+        );
+        assert_eq!(
+            parse_codex_sandbox_mode("workspace-write"),
+            Some(CodexSandboxMode::WorkspaceWrite)
+        );
+        assert_eq!(
+            parse_codex_sandbox_mode("agent"),
+            Some(CodexSandboxMode::WorkspaceWrite)
+        );
+        assert_eq!(
+            parse_codex_sandbox_mode("danger-full-access"),
+            Some(CodexSandboxMode::DangerFullAccess)
+        );
+        assert_eq!(parse_codex_sandbox_mode("???"), None);
+    }
+
+    #[test]
+    fn parse_codex_approval_policy_ok() {
+        assert_eq!(
+            parse_codex_approval_policy("on-request"),
+            Some(CodexApprovalPolicy::OnRequest)
+        );
+        assert_eq!(
+            parse_codex_approval_policy("on-failure"),
+            Some(CodexApprovalPolicy::OnFailure)
+        );
+        assert_eq!(
+            parse_codex_approval_policy("untrusted"),
+            Some(CodexApprovalPolicy::Untrusted)
+        );
+        assert_eq!(
+            parse_codex_approval_policy("never"),
+            Some(CodexApprovalPolicy::Never)
+        );
+        assert_eq!(parse_codex_approval_policy("???"), None);
+    }
+
+    #[test]
+    fn translate_codex_line_ok() {
+        assert!(
+            translate_codex_line("error: unexpected argument '--ask-for-approval' found")
+                .unwrap()
+                .contains("option --ask-for-approval")
+        );
+        assert!(
+            translate_codex_line(
+                "tip: to pass '--ask-for-approval' as a value, use '-- --ask-for-approval'"
+            )
+            .unwrap()
+            .starts_with("Astuce")
+        );
+        assert!(
+            translate_codex_line("Usage: codex exec --json --sandbox <SANDBOX_MODE> [PROMPT]")
+                .unwrap()
+                .contains("Utilisation")
+        );
+        assert!(
+            translate_codex_line("For more information, try '--help'.")
+                .unwrap()
+                .contains("--help")
+        );
     }
 
     #[test]
