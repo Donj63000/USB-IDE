@@ -82,10 +82,10 @@ pub fn detect_text_encoding(path: &Path) -> String {
     };
 
     for enc in ["utf-8", "utf-8-sig", "windows-1252", "latin-1"] {
-        if let Some((_, had_errors)) = decode_with_encoding(&bytes, enc) {
-            if !had_errors {
-                return enc.to_string();
-            }
+        if let Some((_, had_errors)) = decode_with_encoding(&bytes, enc)
+            && !had_errors
+        {
+            return enc.to_string();
         }
     }
 

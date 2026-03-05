@@ -240,6 +240,22 @@ fn env_path_from_map(
     env_value_from_map(env_map, "PATH", is_windows)
 }
 
+fn env_flag_truthy(env_map: Option<&HashMap<String, String>>, key: &str, is_windows: bool) -> bool {
+    env_value_from_map(env_map, key, is_windows)
+        .or_else(|| env::var(key).ok())
+        .map(|raw| {
+            matches!(
+                raw.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn allow_host_node(env_map: Option<&HashMap<String, String>>, is_windows: bool) -> bool {
+    env_flag_truthy(env_map, "USBIDE_CODEX_ALLOW_HOST_NODE", is_windows)
+}
+
 pub fn resolve_in_path(cmd: &str, env_map: &HashMap<String, String>) -> Option<PathBuf> {
     let path_value = env_map.get("PATH").cloned().or_else(|| {
         if is_windows() {
@@ -431,20 +447,22 @@ fn node_executable_with_os(
         candidates.push(node_dir.join("node"));
     }
 
+    if let Some(found) = candidates.into_iter().find(|candidate| candidate.exists()) {
+        return Some(found);
+    }
+
+    if !allow_host_node(env_map, is_windows) {
+        return None;
+    }
+
     let path_value = env_map
         .and_then(|env| env_path_from_map(Some(env), is_windows))
         .or_else(|| env::var("PATH").ok());
 
-    if let Some(path) = path_value.as_deref() {
-        if let Some(found) = find_in_path("node", Some(path), is_windows) {
-            candidates.push(found);
-        }
-    }
-
-    for candidate in candidates {
-        if candidate.exists() {
-            return Some(candidate);
-        }
+    if let Some(path) = path_value.as_deref()
+        && let Some(found) = find_in_path("node", Some(path), is_windows)
+    {
+        return Some(found);
     }
     None
 }
@@ -481,10 +499,10 @@ pub fn npm_cli_js(root_dir: &Path, node: Option<&Path>) -> Option<PathBuf> {
             .join("bin")
             .join("npm-cli.js"),
     ] {
-        if let Ok(resolved) = alt.canonicalize() {
-            if resolved.exists() {
-                return Some(resolved);
-            }
+        if let Ok(resolved) = alt.canonicalize()
+            && resolved.exists()
+        {
+            return Some(resolved);
         }
     }
     None
@@ -690,6 +708,16 @@ pub fn codex_exec_argv(
     Ok(argv)
 }
 
+pub fn codex_exec_help_argv(
+    root_dir: Option<&Path>,
+    env_map: Option<&HashMap<String, String>>,
+) -> Vec<String> {
+    let mut argv = codex_base_argv_with_os(root_dir, env_map, is_windows());
+    argv.push("exec".to_string());
+    argv.push("--help".to_string());
+    argv
+}
+
 pub fn codex_install_argv(
     root_dir: &Path,
     prefix: &Path,
@@ -804,18 +832,14 @@ fn extract_text_from_content(content: &Value) -> Vec<String> {
         Value::Array(items) => {
             for item in items {
                 if let Value::Object(map) = item {
-                    if let Some(Value::String(item_type)) = map.get("type") {
-                        if ["output_text", "output_markdown", "text", "input_text"]
+                    if let Some(Value::String(item_type)) = map.get("type")
+                        && ["output_text", "output_markdown", "text", "input_text"]
                             .contains(&item_type.as_str())
-                        {
-                            if let Some(Value::String(text)) =
-                                map.get("text").or_else(|| map.get("content"))
-                            {
-                                if !text.is_empty() {
-                                    texts.push(text.clone());
-                                }
-                            }
-                        }
+                        && let Some(Value::String(text)) =
+                            map.get("text").or_else(|| map.get("content"))
+                        && !text.is_empty()
+                    {
+                        texts.push(text.clone());
                     }
                 } else if let Value::String(text) = item {
                     texts.push(text.clone());
@@ -829,13 +853,13 @@ fn extract_text_from_content(content: &Value) -> Vec<String> {
 }
 
 fn push_item(items: &mut Vec<DisplayItem>, kind: DisplayKind, msg: &Value) {
-    if let Value::String(text) = msg {
-        if !text.is_empty() {
-            items.push(DisplayItem {
-                kind,
-                message: text.clone(),
-            });
-        }
+    if let Value::String(text) = msg
+        && !text.is_empty()
+    {
+        items.push(DisplayItem {
+            kind,
+            message: text.clone(),
+        });
     }
 }
 
@@ -864,13 +888,13 @@ fn items_from_message_payload(payload: &Value) -> Vec<DisplayItem> {
         return items;
     }
 
-    if let Some(Value::String(msg)) = payload.get("message") {
-        if !msg.is_empty() {
-            items.push(DisplayItem {
-                kind,
-                message: msg.clone(),
-            });
-        }
+    if let Some(Value::String(msg)) = payload.get("message")
+        && !msg.is_empty()
+    {
+        items.push(DisplayItem {
+            kind,
+            message: msg.clone(),
+        });
     }
     items
 }
@@ -928,10 +952,10 @@ fn iter_tool_calls(containers: &[&Value]) -> Vec<Value> {
     let mut calls = Vec::new();
     for container in containers {
         if let Value::Object(map) = container {
-            if let Some(tool_call) = map.get("tool_call") {
-                if tool_call.is_object() {
-                    calls.push(tool_call.clone());
-                }
+            if let Some(tool_call) = map.get("tool_call")
+                && tool_call.is_object()
+            {
+                calls.push(tool_call.clone());
             }
             if let Some(Value::Array(list)) = map.get("tool_calls").or_else(|| map.get("tools")) {
                 for call in list {
@@ -982,10 +1006,12 @@ fn format_action(payload: &Value) -> Option<String> {
     let description = payload
         .get("message")
         .or_else(|| payload.get("description"));
-    if let Some(Value::String(desc)) = description {
-        if !desc.trim().is_empty() && name.is_none() && args.is_none() {
-            return Some(desc.trim().to_string());
-        }
+    if let Some(Value::String(desc)) = description
+        && !desc.trim().is_empty()
+        && name.is_none()
+        && args.is_none()
+    {
+        return Some(desc.trim().to_string());
     }
 
     let arg_text = args.map(|val| {
@@ -1011,27 +1037,27 @@ pub fn extract_display_items(obj: &Value) -> Vec<DisplayItem> {
     let event_type = obj.get("type").and_then(Value::as_str);
     let payload = obj.get("payload").unwrap_or(&Value::Null);
 
-    if event_type == Some("event_msg") {
-        if let Value::Object(map) = payload {
-            let payload_type = map.get("type").and_then(Value::as_str);
-            let msg = map
-                .get("message")
-                .or_else(|| map.get("text"))
-                .unwrap_or(&Value::Null);
-            match payload_type {
-                Some("agent_message") | Some("assistant_message") => {
-                    push_item(&mut items, DisplayKind::Assistant, msg);
-                }
-                Some("user_message") | Some("user") => {
-                    push_item(&mut items, DisplayKind::User, msg);
-                }
-                _ => {
-                    if let Some(action) = format_action(payload) {
-                        items.push(DisplayItem {
-                            kind: DisplayKind::Action,
-                            message: action,
-                        });
-                    }
+    if event_type == Some("event_msg")
+        && let Value::Object(map) = payload
+    {
+        let payload_type = map.get("type").and_then(Value::as_str);
+        let msg = map
+            .get("message")
+            .or_else(|| map.get("text"))
+            .unwrap_or(&Value::Null);
+        match payload_type {
+            Some("agent_message") | Some("assistant_message") => {
+                push_item(&mut items, DisplayKind::Assistant, msg);
+            }
+            Some("user_message") | Some("user") => {
+                push_item(&mut items, DisplayKind::User, msg);
+            }
+            _ => {
+                if let Some(action) = format_action(payload) {
+                    items.push(DisplayItem {
+                        kind: DisplayKind::Action,
+                        message: action,
+                    });
                 }
             }
         }
@@ -1220,6 +1246,17 @@ mod tests {
         entry_path
     }
 
+    fn create_host_node_in_path(bin_dir: &Path) -> PathBuf {
+        let node = if is_windows() {
+            bin_dir.join("node.exe")
+        } else {
+            bin_dir.join("node")
+        };
+        fs::create_dir_all(bin_dir).unwrap();
+        fs::write(&node, "").unwrap();
+        node
+    }
+
     #[test]
     fn codex_login_argv_default() {
         let mut env_map = HashMap::new();
@@ -1264,6 +1301,15 @@ mod tests {
         let argv = codex_exec_argv("--help", None, Some(&env_map), true, None).unwrap();
         let pos = argv.iter().position(|arg| arg == "--").unwrap();
         assert_eq!(argv[pos + 1], "--help");
+    }
+
+    #[test]
+    fn codex_exec_help_argv_ok() {
+        let mut env_map = HashMap::new();
+        env_map.insert("PATH".to_string(), String::new());
+        let argv = codex_exec_help_argv(None, Some(&env_map));
+        assert!(argv.contains(&"exec".to_string()));
+        assert!(argv.contains(&"--help".to_string()));
     }
 
     #[test]
@@ -1376,6 +1422,34 @@ mod tests {
         let root = dir.path();
         let node_path = create_portable_node(root);
         assert_eq!(node_executable(root, None).unwrap(), node_path);
+    }
+
+    #[test]
+    fn node_executable_ignore_hote_par_defaut() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let bin_dir = root.join("bin");
+        create_host_node_in_path(&bin_dir);
+        let mut env_map = HashMap::new();
+        env_map.insert("PATH".to_string(), bin_dir.to_string_lossy().to_string());
+        env_map.insert("USBIDE_CODEX_ALLOW_HOST_NODE".to_string(), "0".to_string());
+        assert!(node_executable(root, Some(&env_map)).is_none());
+    }
+
+    #[test]
+    fn node_executable_allow_hote_si_override() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let bin_dir = root.join("bin");
+        let host_node = create_host_node_in_path(&bin_dir);
+        let mut env_map = HashMap::new();
+        env_map.insert("PATH".to_string(), bin_dir.to_string_lossy().to_string());
+        env_map.insert("USBIDE_CODEX_ALLOW_HOST_NODE".to_string(), "1".to_string());
+        let resolved = node_executable(root, Some(&env_map)).unwrap();
+        assert_eq!(
+            resolved.to_string_lossy().to_lowercase(),
+            host_node.to_string_lossy().to_lowercase()
+        );
     }
 
     #[test]

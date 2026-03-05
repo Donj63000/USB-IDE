@@ -8,12 +8,12 @@ use eframe::egui::{self, Color32, RichText, ScrollArea, TextEdit};
 
 use crate::codex::{
     CodexApprovalPolicy, CodexError, CodexSandboxMode, DisplayKind, codex_approval_policy_from_env,
-    codex_cli_available, codex_entrypoint_js, codex_env, codex_exec_argv, codex_hint_for_status,
-    codex_install_argv, codex_install_prefix, codex_login_argv, codex_sandbox_mode_from_env,
-    codex_status_argv, extract_display_items, extract_status_code, node_executable,
-    parse_tool_list, pip_install_argv, pyinstaller_available, pyinstaller_build_argv,
-    pyinstaller_install_argv, resolve_in_path, tools_env, tools_install_prefix,
-    translate_codex_line,
+    codex_cli_available, codex_entrypoint_js, codex_env, codex_exec_argv, codex_exec_help_argv,
+    codex_hint_for_status, codex_install_argv, codex_install_prefix, codex_login_argv,
+    codex_sandbox_mode_from_env, codex_status_argv, extract_display_items, extract_status_code,
+    node_executable, parse_tool_list, pip_install_argv, pyinstaller_available,
+    pyinstaller_build_argv, pyinstaller_install_argv, resolve_in_path, tools_env,
+    tools_install_prefix, translate_codex_line,
 };
 use crate::fs::{detect_text_encoding, is_probably_binary, read_text_with_encoding};
 use crate::process::{
@@ -37,6 +37,39 @@ fn panel_bg() -> Color32 {
 
 fn panel_border() -> Color32 {
     Color32::from_rgb(46, 54, 66)
+}
+
+fn codex_info_color() -> Color32 {
+    Color32::from_gray(210)
+}
+
+fn codex_user_color() -> Color32 {
+    Color32::from_rgb(120, 190, 255)
+}
+
+fn codex_assistant_color() -> Color32 {
+    Color32::from_rgb(120, 220, 160)
+}
+
+fn codex_action_color() -> Color32 {
+    Color32::from_rgb(230, 180, 85)
+}
+
+fn codex_error_color() -> Color32 {
+    Color32::from_rgb(255, 100, 100)
+}
+
+fn codex_hint_color() -> Color32 {
+    Color32::from_rgb(240, 200, 120)
+}
+
+fn codex_label_bg(kind: LogKind) -> Color32 {
+    match kind {
+        LogKind::User => Color32::from_rgb(24, 40, 64),
+        LogKind::Assistant => Color32::from_rgb(24, 48, 36),
+        LogKind::Action => Color32::from_rgb(54, 42, 22),
+        _ => Color32::from_rgb(30, 34, 40),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +106,7 @@ enum ProcessKind {
     Shell,
     PythonRun,
     CodexExec,
+    CodexCaps,
     CodexLogin,
     CodexStatus,
     CodexInstall,
@@ -154,15 +188,13 @@ fn build_tree(path: &Path) -> FileNode {
         .unwrap_or_else(|| path.display().to_string());
     let is_dir = path.is_dir();
     let mut children = Vec::new();
-    if is_dir {
-        if let Ok(read_dir) = std::fs::read_dir(path) {
-            for entry in read_dir.flatten() {
-                let child_path = entry.path();
-                let child = build_tree(&child_path);
-                children.push(child);
-            }
-            children.sort_by_key(|node| (!node.is_dir, node.name.to_lowercase()));
+    if is_dir && let Ok(read_dir) = std::fs::read_dir(path) {
+        for entry in read_dir.flatten() {
+            let child_path = entry.path();
+            let child = build_tree(&child_path);
+            children.push(child);
         }
+        children.sort_by_key(|node| (!node.is_dir, node.name.to_lowercase()));
     }
     FileNode {
         path: path.to_path_buf(),
@@ -271,6 +303,9 @@ struct GuiApp {
     codex_last_prompt: Option<String>,
     codex_retry_without_sandbox: bool,
     codex_retry_without_approval: bool,
+    codex_caps_checked: bool,
+    codex_caps_running: bool,
+    codex_caps_buffer: String,
     codex_log_buffer: String,
     codex_log_dirty: bool,
     last_codex_message: Option<String>,
@@ -278,6 +313,7 @@ struct GuiApp {
     codex_install_attempted: bool,
     pyinstaller_install_attempted: bool,
     pending_codex_prompt: Option<String>,
+    codex_follow_output: bool,
     last_window_title: String,
 }
 
@@ -312,6 +348,9 @@ impl GuiApp {
             codex_last_prompt: None,
             codex_retry_without_sandbox: false,
             codex_retry_without_approval: false,
+            codex_caps_checked: false,
+            codex_caps_running: false,
+            codex_caps_buffer: String::new(),
             codex_log_buffer: String::new(),
             codex_log_dirty: true,
             last_codex_message: None,
@@ -319,6 +358,7 @@ impl GuiApp {
             codex_install_attempted: false,
             pyinstaller_install_attempted: false,
             pending_codex_prompt: None,
+            codex_follow_output: true,
             last_window_title: String::new(),
         };
         app.ensure_portable_dirs();
@@ -690,6 +730,14 @@ impl GuiApp {
                 if ui.button(label).clicked() {
                     self.action_toggle_codex_view();
                 }
+                let follow_label = if self.codex_follow_output {
+                    "Suivi: actif"
+                } else {
+                    "Suivi: pause"
+                };
+                if ui.button(follow_label).clicked() {
+                    self.codex_follow_output = !self.codex_follow_output;
+                }
             });
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
@@ -745,18 +793,138 @@ impl GuiApp {
     fn draw_codex_log(&mut self, ui: &mut egui::Ui) {
         if self.codex_log_dirty {
             self.codex_log_buffer = self.render_plain_log(&self.codex_log);
-            self.codex_log_dirty = false;
         }
         let available = ui.available_size();
-        let response = ui.add_sized(
-            available,
-            TextEdit::multiline(&mut self.codex_log_buffer)
-                .desired_width(f32::INFINITY)
-                .lock_focus(true),
-        );
-        if response.changed() {
+        let follow = self.codex_follow_output;
+        let mut response_id = None;
+        let mut response_changed = false;
+        let need_scroll_to_end = self.codex_log_dirty && follow;
+        let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+            let job = GuiApp::codex_log_layout_job(ui, text, wrap_width);
+            ui.fonts(|fonts| fonts.layout_job(job))
+        };
+        ScrollArea::vertical()
+            .id_source("codex_log_scroll")
+            .auto_shrink([false, false])
+            .stick_to_bottom(follow)
+            .show(ui, |ui| {
+                ui.set_min_size(available);
+                let response = ui.add_sized(
+                    available,
+                    TextEdit::multiline(&mut self.codex_log_buffer)
+                        .desired_width(f32::INFINITY)
+                        .min_size(available)
+                        .lock_focus(false)
+                        .cursor_at_end(need_scroll_to_end)
+                        .layouter(&mut layouter),
+                );
+                response_id = Some(response.id);
+                response_changed = response.changed();
+            });
+        if need_scroll_to_end
+            && let Some(id) = response_id
+            && let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id)
+        {
+            let end = self.codex_log_buffer.chars().count();
+            let ccursor = egui::text::CCursor::new(end);
+            let range = egui::text::CCursorRange::one(ccursor);
+            state.cursor.set_char_range(Some(range));
+            state.store(ui.ctx(), id);
+        }
+        if response_changed {
             self.codex_log_buffer = self.render_plain_log(&self.codex_log);
-            self.codex_log_dirty = false;
+        }
+        self.codex_log_dirty = false;
+    }
+
+    fn handle_codex_caps_line(&mut self, line: &str) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if !self.codex_caps_buffer.is_empty() {
+            self.codex_caps_buffer.push('\n');
+        }
+        self.codex_caps_buffer.push_str(trimmed);
+    }
+
+    fn codex_log_layout_job(ui: &egui::Ui, text: &str, wrap_width: f32) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = wrap_width;
+        job.wrap.break_anywhere = true;
+
+        let font_id = ui
+            .style()
+            .text_styles
+            .get(&egui::TextStyle::Monospace)
+            .cloned()
+            .unwrap_or_else(|| egui::FontId::new(13.0, egui::FontFamily::Monospace));
+        let line_height = (font_id.size + 6.0).max(16.0);
+
+        let mut current_kind: Option<LogKind> = None;
+        let mut lines = text.split('\n').peekable();
+        while let Some(line) = lines.next() {
+            let trimmed = line.trim();
+            let mut format = egui::text::TextFormat {
+                font_id: font_id.clone(),
+                line_height: Some(line_height),
+                ..Default::default()
+            };
+
+            if let Some(kind) = GuiApp::codex_line_kind(trimmed) {
+                current_kind = Some(kind);
+                format.color = GuiApp::codex_color_for_kind(kind);
+                format.background = codex_label_bg(kind);
+            } else if trimmed.is_empty() {
+                current_kind = None;
+                format.color = codex_info_color();
+            } else if GuiApp::codex_is_error_line(trimmed) {
+                format.color = codex_error_color();
+            } else if GuiApp::codex_is_hint_line(trimmed) {
+                format.color = codex_hint_color();
+            } else if let Some(kind) = current_kind {
+                format.color = GuiApp::codex_color_for_kind(kind);
+            } else {
+                format.color = codex_info_color();
+            }
+
+            job.append(line, 0.0, format.clone());
+            if lines.peek().is_some() {
+                job.append("\n", 0.0, format);
+            }
+        }
+        job
+    }
+
+    fn codex_line_kind(line: &str) -> Option<LogKind> {
+        match line {
+            "Assistant" => Some(LogKind::Assistant),
+            "Utilisateur" => Some(LogKind::User),
+            "Action" => Some(LogKind::Action),
+            _ => None,
+        }
+    }
+
+    fn codex_is_error_line(line: &str) -> bool {
+        let lower = line.to_lowercase();
+        lower.starts_with("erreur")
+            || lower.starts_with("echec")
+            || lower.contains("terminee en erreur")
+    }
+
+    fn codex_is_hint_line(line: &str) -> bool {
+        let lower = line.to_lowercase();
+        lower.starts_with("astuce") || lower.starts_with("tip")
+    }
+
+    fn codex_color_for_kind(kind: LogKind) -> Color32 {
+        match kind {
+            LogKind::User => codex_user_color(),
+            LogKind::Assistant => codex_assistant_color(),
+            LogKind::Action => codex_action_color(),
+            LogKind::Warn => codex_hint_color(),
+            LogKind::Error => codex_error_color(),
+            LogKind::Info => codex_info_color(),
         }
     }
 
@@ -845,6 +1013,9 @@ impl GuiApp {
             self.root_dir.join("cache").join("npm"),
             self.root_dir.join("tmp"),
             self.root_dir.join("codex_home"),
+            self.root_dir.join(".usbide"),
+            self.root_dir.join(".usbide").join("codex"),
+            self.root_dir.join(".usbide").join("tools"),
         ] {
             let _ = std::fs::create_dir_all(path);
         }
@@ -945,7 +1116,7 @@ impl GuiApp {
         let expected = self.root_dir.join("tools").join("node");
         self.log_issue(
             &format!(
-                "Node portable introuvable. Place node dans {} (ex: node.exe) ou ajoute node au PATH.",
+                "Node portable introuvable. Place node dans {} (ex: node.exe). Fallback Node hote possible via USBIDE_CODEX_ALLOW_HOST_NODE=1.",
                 expected.display()
             ),
             "erreur",
@@ -1437,16 +1608,16 @@ impl GuiApp {
             self.action_save();
         }
         let env_map = self.tools_env();
-        if !pyinstaller_available(Some(&self.root_dir), Some(&env_map)) {
-            if !self.install_pyinstaller(false) {
-                self.log_issue(
-                    "PyInstaller indisponible.",
-                    "erreur",
-                    "build_exe",
-                    LogTarget::Main,
-                );
-                return;
-            }
+        if !pyinstaller_available(Some(&self.root_dir), Some(&env_map))
+            && !self.install_pyinstaller(false)
+        {
+            self.log_issue(
+                "PyInstaller indisponible.",
+                "erreur",
+                "build_exe",
+                LogTarget::Main,
+            );
+            return;
         }
         let dist_dir = self.root_dir.join("dist");
         let _ = std::fs::create_dir_all(&dist_dir);
@@ -1585,7 +1756,7 @@ impl GuiApp {
             Ok(argv) => argv,
             Err(CodexError::NodeMissing) => {
                 self.log_issue(
-                    "Node portable introuvable. Place node dans tools/node (ex: node.exe) ou ajoute node au PATH.",
+                    "Node portable introuvable. Place node dans tools/node (ex: node.exe). Fallback Node hote possible via USBIDE_CODEX_ALLOW_HOST_NODE=1.",
                     "erreur",
                     "installation_codex",
                     target,
@@ -1668,6 +1839,24 @@ impl GuiApp {
             return;
         }
 
+        if !self.codex_caps_checked {
+            self.pending_codex_prompt = Some(prompt);
+            if self.codex_caps_running {
+                return;
+            }
+            self.codex_caps_running = true;
+            self.codex_caps_buffer.clear();
+            let argv = codex_exec_help_argv(Some(&self.root_dir), Some(&env_map));
+            self.spawn_process(
+                argv,
+                env_map,
+                "codex_caps",
+                LogTarget::Codex,
+                ProcessKind::CodexCaps,
+            );
+            return;
+        }
+
         self.pending_codex_prompt = Some(prompt);
         let argv = codex_status_argv(Some(&self.root_dir), Some(&env_map));
         self.spawn_process(
@@ -1719,8 +1908,18 @@ impl GuiApp {
                         self.handle_process_line(&mut proc, &event.text);
                     }
                     ProcEventKind::Exit => {
-                        if let Some(code) = event.returncode {
-                            if code != 0 {
+                        if let Some(code) = event.returncode
+                            && code != 0
+                        {
+                            let should_log = match proc.kind {
+                                ProcessKind::CodexExec => {
+                                    !(self.codex_retry_without_sandbox
+                                        || self.codex_retry_without_approval)
+                                }
+                                ProcessKind::CodexCaps => false,
+                                _ => true,
+                            };
+                            if should_log {
                                 self.log_issue(
                                     &format!("{} terminee en erreur (rc={code}).", proc.contexte),
                                     "erreur",
@@ -1750,6 +1949,7 @@ impl GuiApp {
     fn handle_process_line(&mut self, proc: &mut RunningProcess, line: &str) {
         match proc.kind {
             ProcessKind::CodexExec => self.handle_codex_line(line),
+            ProcessKind::CodexCaps => self.handle_codex_caps_line(line),
             _ => self.push_log(proc.target, line.to_string(), LogKind::Info),
         }
     }
@@ -1810,6 +2010,30 @@ impl GuiApp {
                             );
                         }
                     }
+                }
+            }
+            ProcessKind::CodexCaps => {
+                self.codex_caps_running = false;
+                self.codex_caps_checked = true;
+                let lower = self.codex_caps_buffer.to_lowercase();
+                if !lower.is_empty() {
+                    if !lower.contains("--sandbox") {
+                        self.codex_sandbox_supported = Some(false);
+                    }
+                    if !lower.contains("--ask-for-approval") {
+                        self.codex_approval_supported = Some(false);
+                    }
+                    if self.codex_sandbox_supported == Some(false)
+                        || self.codex_approval_supported == Some(false)
+                    {
+                        self.codex_log_action(
+                            "Version Codex ancienne: sandbox/approbations indisponibles. Mets a jour pour un mode agent complet.",
+                        );
+                    }
+                }
+                self.codex_caps_buffer.clear();
+                if let Some(prompt) = self.pending_codex_prompt.take() {
+                    self.run_codex(prompt);
                 }
             }
             ProcessKind::CodexExec => {
