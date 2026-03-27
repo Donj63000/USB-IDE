@@ -6,3 +6,10 @@
 /tools
 /dist
 /bug.md
+
+#J'ignore les artefacts Python recrees localement dans l'ancien projet de reference
+**/__pycache__/
+*.py[cod]
+Projet-a-refaire/IDE-USB-PYTHON/.pytest_cache/
+Projet-a-refaire/IDE-USB-PYTHON/.venv/
+Projet-a-refaire/IDE-USB-PYTHON/cache/

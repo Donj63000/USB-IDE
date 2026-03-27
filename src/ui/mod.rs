@@ -1,10 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use chrono::Local;
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{
@@ -18,29 +17,27 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use tui_textarea::{Input, TextArea};
 
+use crate::app_core::{
+    APP_NAME, AppCore, LOG_LIMIT, LogTarget, OpenFile, ProcessKind, RunningProcess,
+    codex_approval_label, codex_exec_extra_args, codex_sandbox_label, next_codex_approval_policy,
+    next_codex_sandbox_mode,
+};
 use crate::codex::{
     CodexApprovalPolicy, CodexError, CodexSandboxMode, DisplayKind, codex_approval_policy_from_env,
-    codex_cli_available, codex_entrypoint_js, codex_env, codex_exec_argv, codex_exec_help_argv,
+    codex_cli_available, codex_entrypoint_js, codex_exec_argv, codex_exec_help_argv,
     codex_hint_for_status, codex_install_argv, codex_install_prefix, codex_login_argv,
     codex_sandbox_mode_from_env, codex_status_argv, extract_display_items, extract_status_code,
     node_executable, parse_tool_list, pip_install_argv, pyinstaller_available,
-    pyinstaller_build_argv, pyinstaller_install_argv, resolve_in_path, tools_env,
-    tools_install_prefix, translate_codex_line,
+    pyinstaller_build_argv, pyinstaller_install_argv, resolve_in_path, tools_install_prefix,
+    translate_codex_line,
 };
-use crate::fs::{detect_text_encoding, is_probably_binary, read_text_with_encoding};
+use crate::fs::write_text_with_encoding;
 use crate::process::{
-    ProcEventKind, ProcHandle, python_run_argv, stream_subprocess, windows_cmd_argv,
+    NativeProcessRunner, ProcEventKind, ProcessRunner, python_run_argv, windows_cmd_argv,
 };
-
-const LOG_LIMIT: usize = 2000;
-const APP_NAME: &str = "ValDev Pro v1";
-
-#[derive(Debug, Clone)]
-struct OpenFile {
-    path: PathBuf,
-    encoding: String,
-    dirty: bool,
-}
+use crate::workspace::{
+    FileTreeData, OpenWorkspaceFileError, TreeEntry, WorkspacePaths, open_workspace_file,
+};
 
 #[derive(Debug, Clone)]
 struct LogLine {
@@ -54,33 +51,6 @@ enum Focus {
     Editor,
     Cmd,
     Codex,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LogTarget {
-    Main,
-    Codex,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessKind {
-    Shell,
-    PythonRun,
-    CodexExec,
-    CodexCaps,
-    CodexLogin,
-    CodexStatus,
-    CodexInstall,
-    DevTools,
-    PyInstallerInstall,
-    PyInstallerBuild,
-}
-
-struct RunningProcess {
-    handle: ProcHandle,
-    kind: ProcessKind,
-    target: LogTarget,
-    contexte: String,
 }
 
 struct InputField {
@@ -189,74 +159,49 @@ impl InputField {
     }
 }
 
-#[derive(Debug, Clone)]
-struct TreeEntry {
-    path: PathBuf,
-    name: String,
-    depth: usize,
-    is_dir: bool,
-}
-
-#[derive(Debug, Clone)]
-struct FileNode {
-    path: PathBuf,
-    name: String,
-    is_dir: bool,
-    children: Vec<FileNode>,
-}
-
 struct FileTree {
-    root: FileNode,
-    expanded: HashSet<PathBuf>,
-    visible: Vec<TreeEntry>,
+    data: FileTreeData,
     state: ListState,
 }
 
 impl FileTree {
-    fn new(root_dir: &Path) -> Self {
-        let root = build_tree(root_dir);
-        let mut expanded = HashSet::new();
-        expanded.insert(root.path.clone());
+    fn new(workspace: &WorkspacePaths) -> Self {
         let mut tree = Self {
-            root,
-            expanded,
-            visible: Vec::new(),
+            data: FileTreeData::new(workspace),
             state: ListState::default(),
         };
-        tree.rebuild_visible();
         tree.state.select(Some(0));
         tree
     }
 
-    fn rebuild_visible(&mut self) {
-        self.visible.clear();
-        let mut entries = Vec::new();
-        flatten_tree(&self.root, 0, &self.expanded, &mut entries);
-        self.visible = entries;
-        if self.visible.is_empty() {
+    fn reload(&mut self, workspace: &WorkspacePaths) {
+        self.data.reload(workspace);
+        if self.data.visible().is_empty() {
             self.state.select(None);
-        } else if self.state.selected().unwrap_or(0) >= self.visible.len() {
-            self.state.select(Some(self.visible.len() - 1));
+        } else if self.state.selected().unwrap_or(0) >= self.data.visible().len() {
+            self.state.select(Some(self.data.visible().len() - 1));
         }
     }
 
     fn selected_entry(&self) -> Option<&TreeEntry> {
-        self.state.selected().and_then(|idx| self.visible.get(idx))
+        self.state
+            .selected()
+            .and_then(|idx| self.data.visible().get(idx))
     }
 
     fn select_next(&mut self) {
-        if self.visible.is_empty() {
+        if self.data.visible().is_empty() {
             return;
         }
         let next = match self.state.selected() {
-            Some(idx) => (idx + 1).min(self.visible.len() - 1),
+            Some(idx) => (idx + 1).min(self.data.visible().len() - 1),
             None => 0,
         };
         self.state.select(Some(next));
     }
 
     fn select_prev(&mut self) {
-        if self.visible.is_empty() {
+        if self.data.visible().is_empty() {
             return;
         }
         let prev = match self.state.selected() {
@@ -271,55 +216,7 @@ impl FileTree {
             Some(entry) if entry.is_dir => entry.path.clone(),
             _ => return,
         };
-        if self.expanded.contains(&path) {
-            self.expanded.remove(&path);
-        } else {
-            self.expanded.insert(path);
-        }
-        self.rebuild_visible();
-    }
-}
-
-fn build_tree(path: &Path) -> FileNode {
-    let name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(".")
-        .to_string();
-    let is_dir = path.is_dir();
-    let mut children = Vec::new();
-    if is_dir && let Ok(read_dir) = fs::read_dir(path) {
-        for entry in read_dir.flatten() {
-            let child_path = entry.path();
-            let child = build_tree(&child_path);
-            children.push(child);
-        }
-        children.sort_by_key(|node| (!node.is_dir, node.name.to_lowercase()));
-    }
-    FileNode {
-        path: path.to_path_buf(),
-        name,
-        is_dir,
-        children,
-    }
-}
-
-fn flatten_tree(
-    node: &FileNode,
-    depth: usize,
-    expanded: &HashSet<PathBuf>,
-    out: &mut Vec<TreeEntry>,
-) {
-    out.push(TreeEntry {
-        path: node.path.clone(),
-        name: node.name.clone(),
-        depth,
-        is_dir: node.is_dir,
-    });
-    if node.is_dir && expanded.contains(&node.path) {
-        for child in &node.children {
-            flatten_tree(child, depth + 1, expanded, out);
-        }
+        self.data.toggle_dir(&path);
     }
 }
 
@@ -339,6 +236,7 @@ pub fn run(root_dir: PathBuf) -> Result<()> {
 
 struct App {
     root_dir: PathBuf,
+    core: AppCore,
     current: Option<OpenFile>,
     tree: FileTree,
     editor: TextArea<'static>,
@@ -364,10 +262,6 @@ struct App {
     codex_caps_buffer: String,
     last_codex_message: Option<String>,
     codex_assistant_buffer: String,
-    running: Vec<RunningProcess>,
-    bug_log_path: PathBuf,
-    codex_install_attempted: bool,
-    pyinstaller_install_attempted: bool,
     last_codex_width: u16,
     pending_codex_prompt: Option<String>,
 }
@@ -375,10 +269,11 @@ struct App {
 impl App {
     fn new(root_dir: PathBuf) -> Result<Self> {
         let root_dir = root_dir.canonicalize().unwrap_or(root_dir);
-        let bug_log_path = root_dir.join("bug.md");
-        let tree = FileTree::new(&root_dir);
+        let core = AppCore::new(root_dir.clone());
+        let tree = FileTree::new(core.workspace());
         let mut app = Self {
             root_dir,
+            core,
             current: None,
             tree,
             editor: Self::make_editor(),
@@ -404,14 +299,10 @@ impl App {
             codex_caps_buffer: String::new(),
             last_codex_message: None,
             codex_assistant_buffer: String::new(),
-            running: Vec::new(),
-            bug_log_path,
-            codex_install_attempted: false,
-            pyinstaller_install_attempted: false,
             last_codex_width: 80,
             pending_codex_prompt: None,
         };
-        app.ensure_portable_dirs();
+        app.core.ensure_portable_dirs();
         app.refresh_title();
         app.log_ui(format!(
             "{APP_NAME}\nRoot: {}\nShell: champ 'Commande' - Codex: champ 'Codex' - Ctrl+K login - Ctrl+I install - Ctrl+O sandbox - Ctrl+P approb\n",
@@ -419,11 +310,11 @@ impl App {
         ));
         app.codex_log_ui(format!(
             "Sandbox Codex: {}",
-            Self::codex_sandbox_label(app.codex_sandbox_mode)
+            codex_sandbox_label(app.codex_sandbox_mode)
         ));
         app.codex_log_ui(format!(
             "Approbations Codex: {}",
-            Self::codex_approval_label(app.codex_approval_policy)
+            codex_approval_label(app.codex_approval_policy)
         ));
         Ok(app)
     }
@@ -499,9 +390,9 @@ impl App {
 
     fn draw_tree(&mut self, f: &mut ratatui::Frame<'_>, area: Rect) {
         let mut items = Vec::new();
-        for entry in &self.tree.visible {
+        for entry in self.tree.data.visible() {
             let indent = "  ".repeat(entry.depth);
-            let is_expanded = self.tree.expanded.contains(&entry.path);
+            let is_expanded = self.tree.data.is_expanded(&entry.path);
             let icon = if entry.is_dir {
                 if is_expanded { "-" } else { "+" }
             } else {
@@ -799,126 +690,15 @@ impl App {
     fn log_issue(&mut self, msg: &str, niveau: &str, contexte: &str, target: LogTarget) {
         let styled = Style::default().fg(Color::Red);
         self.push_log(target, msg.to_string(), styled);
-        self.record_issue(niveau, msg, contexte, None);
-    }
-
-    fn record_issue(&self, niveau: &str, message: &str, contexte: &str, details: Option<&str>) {
-        let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        let mut lines = vec![
-            format!("## {timestamp}"),
-            format!("- niveau: {niveau}"),
-            format!("- contexte: {contexte}"),
-            format!("- message: {message}"),
-        ];
-        if let Some(details) = details {
-            lines.push(format!("- details: {details}"));
-        }
-        lines.push(String::new());
-        let content = lines.join("\n");
-        let _ = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.bug_log_path)
-            .and_then(|mut file| std::io::Write::write_all(&mut file, content.as_bytes()));
-    }
-
-    fn ensure_portable_dirs(&self) {
-        for path in [
-            self.root_dir.join("cache").join("pip"),
-            self.root_dir.join("cache").join("pycache"),
-            self.root_dir.join("cache").join("npm"),
-            self.root_dir.join("tmp"),
-            self.root_dir.join("codex_home"),
-            self.root_dir.join(".usbide"),
-            self.root_dir.join(".usbide").join("codex"),
-            self.root_dir.join(".usbide").join("tools"),
-        ] {
-            let _ = fs::create_dir_all(path);
-        }
+        self.core.record_issue(niveau, msg, contexte, None);
     }
 
     fn portable_env(&self, mut env_map: HashMap<String, String>) -> HashMap<String, String> {
-        env_map.insert(
-            "PIP_CACHE_DIR".to_string(),
-            self.root_dir
-                .join("cache")
-                .join("pip")
-                .display()
-                .to_string(),
-        );
-        env_map.insert(
-            "PYTHONPYCACHEPREFIX".to_string(),
-            self.root_dir
-                .join("cache")
-                .join("pycache")
-                .display()
-                .to_string(),
-        );
-        env_map.insert(
-            "TEMP".to_string(),
-            self.root_dir.join("tmp").display().to_string(),
-        );
-        env_map.insert(
-            "TMP".to_string(),
-            self.root_dir.join("tmp").display().to_string(),
-        );
-        env_map.insert("PYTHONNOUSERSITE".to_string(), "1".to_string());
-        env_map.insert(
-            "CODEX_HOME".to_string(),
-            self.root_dir.join("codex_home").display().to_string(),
-        );
-        env_map.insert(
-            "NPM_CONFIG_CACHE".to_string(),
-            self.root_dir
-                .join("cache")
-                .join("npm")
-                .display()
-                .to_string(),
-        );
-        env_map.insert(
-            "NPM_CONFIG_UPDATE_NOTIFIER".to_string(),
-            "false".to_string(),
-        );
-        env_map
-    }
-
-    fn truthy(value: Option<&String>) -> bool {
-        value
-            .map(|v| v.trim().to_lowercase())
-            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
-    }
-
-    fn sanitize_codex_env(&self, env_map: &mut HashMap<String, String>) {
-        let allow_api_key = Self::truthy(std::env::var("USBIDE_CODEX_ALLOW_API_KEY").ok().as_ref());
-        let allow_custom_base = Self::truthy(
-            std::env::var("USBIDE_CODEX_ALLOW_CUSTOM_BASE")
-                .ok()
-                .as_ref(),
-        );
-
-        if !allow_api_key {
-            env_map.remove("OPENAI_API_KEY");
-            env_map.remove("CODEX_API_KEY");
-        }
-        if !allow_custom_base {
-            env_map.remove("OPENAI_BASE_URL");
-            env_map.remove("OPENAI_API_BASE");
-            env_map.remove("OPENAI_API_HOST");
-        }
+        self.core.portable_env(std::mem::take(&mut env_map))
     }
 
     fn codex_env(&self) -> HashMap<String, String> {
-        let mut env_map: HashMap<String, String> = std::env::vars().collect();
-        env_map
-            .entry("PYTHONUTF8".to_string())
-            .or_insert_with(|| "1".to_string());
-        env_map
-            .entry("PYTHONIOENCODING".to_string())
-            .or_insert_with(|| "utf-8".to_string());
-        env_map = self.portable_env(env_map);
-        self.sanitize_codex_env(&mut env_map);
-        codex_env(&self.root_dir, Some(&env_map))
+        self.core.codex_env()
     }
 
     fn ensure_node_available(
@@ -926,49 +706,25 @@ impl App {
         env_map: &HashMap<String, String>,
         target: LogTarget,
     ) -> bool {
-        if node_executable(&self.root_dir, Some(env_map)).is_some() {
-            return true;
+        if let Some(message) = self.core.ensure_node_available_message(env_map) {
+            self.log_issue(&message, "erreur", "node", target);
+            return false;
         }
-        let expected = self.root_dir.join("tools").join("node");
-        self.log_issue(
-            &format!(
-                "Node portable introuvable. Place node dans {} (ex: node.exe). Fallback Node hote possible via USBIDE_CODEX_ALLOW_HOST_NODE=1.",
-                expected.display()
-            ),
-            "erreur",
-            "node",
-            target,
-        );
-        false
+        true
     }
 
     fn tools_env(&self) -> HashMap<String, String> {
-        let mut env_map: HashMap<String, String> = std::env::vars().collect();
-        env_map
-            .entry("PYTHONUTF8".to_string())
-            .or_insert_with(|| "1".to_string());
-        env_map
-            .entry("PYTHONIOENCODING".to_string())
-            .or_insert_with(|| "utf-8".to_string());
-        env_map = self.portable_env(env_map);
-        tools_env(&self.root_dir, Some(&env_map))
+        self.core.tools_env()
     }
 
     fn wheelhouse_path(&self) -> Option<PathBuf> {
-        let wheelhouse = self.root_dir.join("tools").join("wheels");
-        if wheelhouse.is_dir() {
-            Some(wheelhouse)
-        } else {
-            None
-        }
+        self.core.wheelhouse_path()
     }
 
     fn open_file(&mut self, path: PathBuf) {
-        if path.is_dir() {
-            return;
-        }
-        match is_probably_binary(&path, 2048) {
-            Ok(true) => {
+        let opened = match open_workspace_file(self.core.workspace(), path) {
+            Ok(opened) => opened,
+            Err(OpenWorkspaceFileError::Binary(path)) => {
                 self.log_issue(
                     &format!("Binaire/non texte ignore: {}", path.display()),
                     "avertissement",
@@ -977,24 +733,27 @@ impl App {
                 );
                 return;
             }
-            Err(err) => {
+            Err(OpenWorkspaceFileError::Hidden(path)) => {
                 self.log_issue(
-                    &format!("Acces fichier impossible: {} ({err})", path.display()),
+                    &format!("Fichier interne masque: {}", path.display()),
+                    "avertissement",
+                    "ouverture_fichier",
+                    LogTarget::Main,
+                );
+                return;
+            }
+            Err(OpenWorkspaceFileError::Sensitive(path)) => {
+                self.log_issue(
+                    &format!("Fichier sensible protege: {}", path.display()),
                     "erreur",
                     "ouverture_fichier",
                     LogTarget::Main,
                 );
                 return;
             }
-            _ => {}
-        }
-
-        let encoding = detect_text_encoding(&path);
-        let text = match read_text_with_encoding(&path, &encoding) {
-            Ok(text) => text,
             Err(err) => {
                 self.log_issue(
-                    &format!("Erreur ouverture: {} ({err})", path.display()),
+                    &err.to_string(),
                     "erreur",
                     "ouverture_fichier",
                     LogTarget::Main,
@@ -1003,7 +762,7 @@ impl App {
             }
         };
 
-        let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+        let mut lines: Vec<String> = opened.text.lines().map(|s| s.to_string()).collect();
         if lines.is_empty() {
             lines.push(String::new());
         }
@@ -1011,8 +770,8 @@ impl App {
         editor.set_block(Block::default().borders(Borders::ALL).title("Editeur"));
         self.editor = editor;
         self.current = Some(OpenFile {
-            path,
-            encoding,
+            path: opened.path,
+            encoding: opened.encoding,
             dirty: false,
         });
         self.refresh_title();
@@ -1040,7 +799,7 @@ impl App {
         }
 
         let content = self.editor.lines().join("\n");
-        let result = self.write_with_encoding(&path, &encoding, &content);
+        let result = write_text_with_encoding(&path, &encoding, &content);
         match result {
             Ok(used_utf8_fallback) => {
                 if used_utf8_fallback {
@@ -1070,31 +829,6 @@ impl App {
                 );
             }
         }
-    }
-
-    fn write_with_encoding(&self, path: &Path, encoding: &str, content: &str) -> Result<bool> {
-        let encoding_lower = encoding.to_lowercase();
-        if encoding_lower == "utf-8" {
-            fs::write(path, content.as_bytes()).context("ecriture fichier")?;
-            return Ok(false);
-        }
-        if encoding_lower == "utf-8-sig" {
-            let mut data = vec![0xEF, 0xBB, 0xBF];
-            data.extend_from_slice(content.as_bytes());
-            fs::write(path, data).context("ecriture fichier")?;
-            return Ok(false);
-        }
-        if let Some(enc) = encoding_rs::Encoding::for_label(encoding_lower.as_bytes()) {
-            let (cow, _, had_errors) = enc.encode(content);
-            if had_errors {
-                fs::write(path, content.as_bytes()).context("ecriture fallback utf-8")?;
-                return Ok(true);
-            }
-            fs::write(path, cow.as_ref()).context("ecriture fichier")?;
-            return Ok(false);
-        }
-        fs::write(path, content.as_bytes()).context("ecriture fallback utf-8")?;
-        Ok(true)
     }
 
     fn action_run(&mut self) {
@@ -1147,7 +881,7 @@ impl App {
     }
 
     fn action_reload_tree(&mut self) {
-        self.tree = FileTree::new(&self.root_dir);
+        self.tree.reload(self.core.workspace());
         self.log_ui("arborescence rechargee".to_string());
     }
 
@@ -1163,18 +897,18 @@ impl App {
     }
 
     fn action_toggle_codex_sandbox(&mut self) {
-        self.codex_sandbox_mode = Self::next_codex_sandbox_mode(self.codex_sandbox_mode);
+        self.codex_sandbox_mode = next_codex_sandbox_mode(self.codex_sandbox_mode);
         self.codex_log_ui(format!(
             "Sandbox Codex: {}",
-            Self::codex_sandbox_label(self.codex_sandbox_mode)
+            codex_sandbox_label(self.codex_sandbox_mode)
         ));
     }
 
     fn action_toggle_codex_approval(&mut self) {
-        self.codex_approval_policy = Self::next_codex_approval_policy(self.codex_approval_policy);
+        self.codex_approval_policy = next_codex_approval_policy(self.codex_approval_policy);
         self.codex_log_ui(format!(
             "Approbations Codex: {}",
-            Self::codex_approval_label(self.codex_approval_policy)
+            codex_approval_label(self.codex_approval_policy)
         ));
     }
 
@@ -1183,76 +917,16 @@ impl App {
     }
 
     fn codex_exec_extra_args(&self) -> Vec<String> {
-        let mut args = Vec::new();
-        if self.codex_sandbox_supported != Some(false) {
-            args.push("--sandbox".to_string());
-            args.push(self.codex_sandbox_mode.as_str().to_string());
-        }
-        if self.codex_approval_supported != Some(false) {
-            args.push("--ask-for-approval".to_string());
-            args.push(self.codex_approval_policy.as_str().to_string());
-        }
-        args
-    }
-
-    fn codex_sandbox_label(mode: CodexSandboxMode) -> &'static str {
-        match mode {
-            CodexSandboxMode::ReadOnly => "lecture seule",
-            CodexSandboxMode::WorkspaceWrite => "agent (workspace)",
-            CodexSandboxMode::DangerFullAccess => "danger (acces complet)",
-        }
-    }
-
-    fn codex_approval_label(policy: CodexApprovalPolicy) -> &'static str {
-        match policy {
-            CodexApprovalPolicy::Untrusted => "non fiable",
-            CodexApprovalPolicy::OnFailure => "sur echec",
-            CodexApprovalPolicy::OnRequest => "sur demande",
-            CodexApprovalPolicy::Never => "jamais",
-        }
-    }
-
-    fn next_codex_sandbox_mode(mode: CodexSandboxMode) -> CodexSandboxMode {
-        match mode {
-            CodexSandboxMode::ReadOnly => CodexSandboxMode::WorkspaceWrite,
-            CodexSandboxMode::WorkspaceWrite => CodexSandboxMode::DangerFullAccess,
-            CodexSandboxMode::DangerFullAccess => CodexSandboxMode::ReadOnly,
-        }
-    }
-
-    fn next_codex_approval_policy(policy: CodexApprovalPolicy) -> CodexApprovalPolicy {
-        match policy {
-            CodexApprovalPolicy::OnRequest => CodexApprovalPolicy::OnFailure,
-            CodexApprovalPolicy::OnFailure => CodexApprovalPolicy::Untrusted,
-            CodexApprovalPolicy::Untrusted => CodexApprovalPolicy::Never,
-            CodexApprovalPolicy::Never => CodexApprovalPolicy::OnRequest,
-        }
-    }
-
-    fn approval_flag_error(line: &str) -> bool {
-        let lower = line.to_lowercase();
-        lower.contains("--ask-for-approval")
-            && (lower.contains("unexpected argument")
-                || lower.contains("unknown argument")
-                || lower.contains("unrecognized"))
-    }
-
-    fn sandbox_flag_error(line: &str) -> bool {
-        let lower = line.to_lowercase();
-        lower.contains("--sandbox")
-            && (lower.contains("unexpected argument")
-                || lower.contains("unknown argument")
-                || lower.contains("unrecognized"))
-    }
-
-    fn sandbox_value_error(line: &str) -> bool {
-        let lower = line.to_lowercase();
-        lower.contains("--sandbox")
-            && (lower.contains("invalid value") || lower.contains("possible values"))
+        codex_exec_extra_args(
+            self.codex_sandbox_supported,
+            self.codex_sandbox_mode,
+            self.codex_approval_supported,
+            self.codex_approval_policy,
+        )
     }
 
     fn handle_approval_flag_line(&mut self, line: &str) -> bool {
-        if !self.codex_exec_used_approval_flag || !Self::approval_flag_error(line) {
+        if !self.codex_exec_used_approval_flag || !crate::app_core::approval_flag_error(line) {
             return false;
         }
         if self.codex_approval_supported != Some(false) {
@@ -1269,7 +943,7 @@ impl App {
         if !self.codex_exec_used_sandbox_flag {
             return false;
         }
-        if Self::sandbox_flag_error(line) || Self::sandbox_value_error(line) {
+        if crate::app_core::sandbox_flag_error(line) || crate::app_core::sandbox_value_error(line) {
             if self.codex_sandbox_supported != Some(false) {
                 self.codex_sandbox_supported = Some(false);
                 self.codex_log_action(
@@ -1477,10 +1151,10 @@ impl App {
         if !force && pyinstaller_available(Some(&self.root_dir), Some(&env_map)) {
             return true;
         }
-        if !force && self.pyinstaller_install_attempted {
+        if !force && self.core.pyinstaller_install_attempted {
             return false;
         }
-        self.pyinstaller_install_attempted = true;
+        self.core.pyinstaller_install_attempted = true;
         let prefix = tools_install_prefix(&self.root_dir);
         let _ = fs::create_dir_all(&prefix);
         let wheelhouse = self.wheelhouse_path();
@@ -1513,25 +1187,11 @@ impl App {
     }
 
     fn codex_device_auth_enabled(&self) -> bool {
-        std::env::var("USBIDE_CODEX_DEVICE_AUTH")
-            .map(|v| {
-                matches!(
-                    v.trim().to_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false)
+        self.core.codex_device_auth_enabled()
     }
 
     fn codex_auto_install_enabled(&self) -> bool {
-        std::env::var("USBIDE_CODEX_AUTO_INSTALL")
-            .map(|v| {
-                !matches!(
-                    v.trim().to_lowercase().as_str(),
-                    "0" | "false" | "no" | "off"
-                )
-            })
-            .unwrap_or(true)
+        self.core.codex_auto_install_enabled()
     }
 
     fn install_codex(&mut self, force: bool, target: LogTarget) -> bool {
@@ -1539,7 +1199,7 @@ impl App {
         if !force && codex_cli_available(Some(&self.root_dir), Some(&env_map)) {
             return true;
         }
-        if !force && self.codex_install_attempted {
+        if !force && self.core.codex_install_attempted {
             self.log_issue(
                 "Installation Codex deja tentee. (Ctrl+I pour forcer)",
                 "avertissement",
@@ -1560,7 +1220,7 @@ impl App {
         if !self.ensure_node_available(&env_map, target) {
             return false;
         }
-        self.codex_install_attempted = true;
+        self.core.codex_install_attempted = true;
         let package = std::env::var("USBIDE_CODEX_NPM_PACKAGE")
             .unwrap_or_else(|_| "@openai/codex".to_string());
         let prefix = codex_install_prefix(&self.root_dir);
@@ -1700,9 +1360,9 @@ impl App {
         target: LogTarget,
         kind: ProcessKind,
     ) {
-        match stream_subprocess(&argv, Some(&self.root_dir), Some(&env_map)) {
+        match NativeProcessRunner.spawn(&argv, Some(&self.root_dir), Some(&env_map)) {
             Ok(handle) => {
-                self.running.push(RunningProcess {
+                self.core.running.push(RunningProcess {
                     handle,
                     kind,
                     target,
@@ -1721,7 +1381,7 @@ impl App {
     }
 
     fn drain_process_events(&mut self) {
-        let mut active = std::mem::take(&mut self.running);
+        let mut active = std::mem::take(&mut self.core.running);
         let mut remaining = Vec::new();
 
         for mut proc in active.drain(..) {
@@ -1766,9 +1426,9 @@ impl App {
             }
         }
 
-        let mut spawned = std::mem::take(&mut self.running);
+        let mut spawned = std::mem::take(&mut self.core.running);
         remaining.append(&mut spawned);
-        self.running = remaining;
+        self.core.running = remaining;
     }
 
     fn handle_process_line(&mut self, proc: &mut RunningProcess, line: &str) {
@@ -2106,6 +1766,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
@@ -2227,7 +1888,7 @@ mod tests {
             ]);
             remove_env("USBIDE_CODEX_ALLOW_API_KEY");
             remove_env("USBIDE_CODEX_ALLOW_CUSTOM_BASE");
-            app.sanitize_codex_env(&mut env);
+            app.core.sanitize_codex_env(&mut env);
             assert!(!env.contains_key("OPENAI_API_KEY"));
             assert!(!env.contains_key("CODEX_API_KEY"));
             assert!(!env.contains_key("OPENAI_BASE_URL"));
@@ -2249,7 +1910,7 @@ mod tests {
             ]);
             set_env("USBIDE_CODEX_ALLOW_API_KEY", "1");
             set_env("USBIDE_CODEX_ALLOW_CUSTOM_BASE", "true");
-            app.sanitize_codex_env(&mut env);
+            app.core.sanitize_codex_env(&mut env);
             assert_eq!(env.get("OPENAI_API_KEY").unwrap(), "sk-test");
             assert_eq!(env.get("CODEX_API_KEY").unwrap(), "sk-codex");
             assert_eq!(env.get("OPENAI_BASE_URL").unwrap(), "https://example.com");
@@ -2286,8 +1947,9 @@ mod tests {
     #[test]
     fn record_issue_cree_bug_md() {
         let dir = TempDir::new().unwrap();
-        let app = App::new(dir.path().to_path_buf()).unwrap();
-        app.record_issue("erreur", "Erreur test", "test_unitaire", None);
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.core
+            .record_issue("erreur", "Erreur test", "test_unitaire", None);
         let contenu = fs::read_to_string(dir.path().join("bug.md")).unwrap();
         assert!(contenu.contains("niveau: erreur"));
         assert!(contenu.contains("contexte: test_unitaire"));

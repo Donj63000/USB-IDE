@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{self, BufRead, Read};
 use std::path::Path;
 
+use anyhow::{Context, Result};
 use encoding_rs::Encoding;
 use regex::Regex;
 
@@ -101,6 +102,32 @@ pub fn read_text_with_encoding(path: &Path, encoding: &str) -> io::Result<String
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
+/// Ecrit un fichier texte avec l'encodage demande. En fallback, ecrit en UTF-8.
+pub fn write_text_with_encoding(path: &Path, encoding: &str, content: &str) -> Result<bool> {
+    let encoding_lower = encoding.to_lowercase();
+    if encoding_lower == "utf-8" {
+        fs::write(path, content.as_bytes()).context("ecriture fichier")?;
+        return Ok(false);
+    }
+    if encoding_lower == "utf-8-sig" {
+        let mut data = vec![0xEF, 0xBB, 0xBF];
+        data.extend_from_slice(content.as_bytes());
+        fs::write(path, data).context("ecriture fichier")?;
+        return Ok(false);
+    }
+    if let Some(enc) = Encoding::for_label(encoding_lower.as_bytes()) {
+        let (cow, _, had_errors) = enc.encode(content);
+        if had_errors {
+            fs::write(path, content.as_bytes()).context("ecriture fallback utf-8")?;
+            return Ok(true);
+        }
+        fs::write(path, cow.as_ref()).context("ecriture fichier")?;
+        return Ok(false);
+    }
+    fs::write(path, content.as_bytes()).context("ecriture fallback utf-8")?;
+    Ok(true)
+}
+
 /// Heuristique simple pour éviter d'ouvrir des binaires dans l'éditeur.
 pub fn is_probably_binary(path: &Path, sniff_bytes: usize) -> io::Result<bool> {
     if sniff_bytes == 0 {
@@ -179,5 +206,38 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("absent.txt");
         assert_eq!(detect_text_encoding(&path), "utf-8");
+    }
+
+    #[test]
+    fn ecrit_utf8_sig() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bom.txt");
+        let fallback = write_text_with_encoding(&path, "utf-8-sig", "Bonjour").unwrap();
+        let bytes = fs::read(&path).unwrap();
+
+        assert!(!fallback);
+        assert!(bytes.starts_with(&[0xEF, 0xBB, 0xBF]));
+    }
+
+    #[test]
+    fn ecrit_windows_1252() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("latin.txt");
+        let fallback = write_text_with_encoding(&path, "windows-1252", "école").unwrap();
+        let content = read_text_with_encoding(&path, "windows-1252").unwrap();
+
+        assert!(!fallback);
+        assert_eq!(content, "école");
+    }
+
+    #[test]
+    fn fallback_utf8_si_caractere_non_supporte() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fallback.txt");
+        let fallback = write_text_with_encoding(&path, "windows-1252", "Bonjour 🚀").unwrap();
+        let bytes = fs::read(&path).unwrap();
+
+        assert!(fallback);
+        assert_eq!(String::from_utf8(bytes).unwrap(), "Bonjour 🚀");
     }
 }

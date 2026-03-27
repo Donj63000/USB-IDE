@@ -1,27 +1,29 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use chrono::Local;
+use anyhow::Result;
 use eframe::egui::{self, Color32, RichText, ScrollArea, TextEdit};
 
+use crate::app_core::{
+    APP_NAME, AppCore, LOG_LIMIT, LogTarget, OpenFile, ProcessKind, RunningProcess,
+    codex_approval_label, codex_exec_extra_args, codex_sandbox_label, next_codex_approval_policy,
+    next_codex_sandbox_mode,
+};
 use crate::codex::{
     CodexApprovalPolicy, CodexError, CodexSandboxMode, DisplayKind, codex_approval_policy_from_env,
-    codex_cli_available, codex_entrypoint_js, codex_env, codex_exec_argv, codex_exec_help_argv,
+    codex_cli_available, codex_entrypoint_js, codex_exec_argv, codex_exec_help_argv,
     codex_hint_for_status, codex_install_argv, codex_install_prefix, codex_login_argv,
     codex_sandbox_mode_from_env, codex_status_argv, extract_display_items, extract_status_code,
     node_executable, parse_tool_list, pip_install_argv, pyinstaller_available,
-    pyinstaller_build_argv, pyinstaller_install_argv, resolve_in_path, tools_env,
-    tools_install_prefix, translate_codex_line,
+    pyinstaller_build_argv, pyinstaller_install_argv, resolve_in_path, tools_install_prefix,
+    translate_codex_line,
 };
-use crate::fs::{detect_text_encoding, is_probably_binary, read_text_with_encoding};
+use crate::fs::write_text_with_encoding;
 use crate::process::{
-    ProcEventKind, ProcHandle, python_run_argv, stream_subprocess, windows_cmd_argv,
+    NativeProcessRunner, ProcEventKind, ProcessRunner, python_run_argv, windows_cmd_argv,
 };
-
-const APP_NAME: &str = "ValDev Pro v1";
-const LOG_LIMIT: usize = 2000;
+use crate::workspace::{FileTreeData, OpenWorkspaceFileError, WorkspacePaths, open_workspace_file};
 
 fn accent_red() -> Color32 {
     Color32::from_rgb(229, 57, 53)
@@ -72,13 +74,6 @@ fn codex_label_bg(kind: LogKind) -> Color32 {
     }
 }
 
-#[derive(Debug, Clone)]
-struct OpenFile {
-    path: PathBuf,
-    encoding: String,
-    dirty: bool,
-}
-
 #[derive(Debug, Clone, Copy)]
 enum LogKind {
     Info,
@@ -95,131 +90,32 @@ struct LogLine {
     kind: LogKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LogTarget {
-    Main,
-    Codex,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessKind {
-    Shell,
-    PythonRun,
-    CodexExec,
-    CodexCaps,
-    CodexLogin,
-    CodexStatus,
-    CodexInstall,
-    DevTools,
-    PyInstallerInstall,
-    PyInstallerBuild,
-}
-
-struct RunningProcess {
-    handle: ProcHandle,
-    kind: ProcessKind,
-    target: LogTarget,
-    contexte: String,
-}
-
-#[derive(Debug, Clone)]
-struct TreeEntry {
-    path: PathBuf,
-    name: String,
-    depth: usize,
-    is_dir: bool,
-}
-
-#[derive(Debug, Clone)]
-struct FileNode {
-    path: PathBuf,
-    name: String,
-    is_dir: bool,
-    children: Vec<FileNode>,
-}
-
 struct FileTree {
-    root: FileNode,
-    expanded: HashSet<PathBuf>,
-    visible: Vec<TreeEntry>,
+    data: FileTreeData,
     selected: Option<PathBuf>,
 }
 
 impl FileTree {
-    fn new(root_dir: &Path) -> Self {
-        let root = build_tree(root_dir);
-        let mut expanded = HashSet::new();
-        expanded.insert(root.path.clone());
+    fn new(workspace: &WorkspacePaths) -> Self {
         let mut tree = Self {
-            root,
-            expanded,
-            visible: Vec::new(),
+            data: FileTreeData::new(workspace),
             selected: None,
         };
-        tree.rebuild_visible();
+        if tree.selected.is_none() {
+            tree.selected = tree.data.visible().first().map(|entry| entry.path.clone());
+        }
         tree
     }
 
-    fn rebuild_visible(&mut self) {
-        self.visible.clear();
-        let mut entries = Vec::new();
-        flatten_tree(&self.root, 0, &self.expanded, &mut entries);
-        self.visible = entries;
+    fn reload(&mut self, workspace: &WorkspacePaths) {
+        self.data.reload(workspace);
         if self.selected.is_none() {
-            self.selected = self.visible.first().map(|entry| entry.path.clone());
+            self.selected = self.data.visible().first().map(|entry| entry.path.clone());
         }
     }
 
     fn toggle_dir(&mut self, path: &Path) {
-        if self.expanded.contains(path) {
-            self.expanded.remove(path);
-        } else {
-            self.expanded.insert(path.to_path_buf());
-        }
-        self.rebuild_visible();
-    }
-}
-
-fn build_tree(path: &Path) -> FileNode {
-    let name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| path.display().to_string());
-    let is_dir = path.is_dir();
-    let mut children = Vec::new();
-    if is_dir && let Ok(read_dir) = std::fs::read_dir(path) {
-        for entry in read_dir.flatten() {
-            let child_path = entry.path();
-            let child = build_tree(&child_path);
-            children.push(child);
-        }
-        children.sort_by_key(|node| (!node.is_dir, node.name.to_lowercase()));
-    }
-    FileNode {
-        path: path.to_path_buf(),
-        name,
-        is_dir,
-        children,
-    }
-}
-
-fn flatten_tree(
-    node: &FileNode,
-    depth: usize,
-    expanded: &HashSet<PathBuf>,
-    out: &mut Vec<TreeEntry>,
-) {
-    out.push(TreeEntry {
-        path: node.path.clone(),
-        name: node.name.clone(),
-        depth,
-        is_dir: node.is_dir,
-    });
-    if node.is_dir && expanded.contains(&node.path) {
-        for child in &node.children {
-            flatten_tree(child, depth + 1, expanded, out);
-        }
+        self.data.toggle_dir(path);
     }
 }
 
@@ -282,6 +178,7 @@ fn configure_style(ctx: &egui::Context) {
 
 struct GuiApp {
     root_dir: PathBuf,
+    core: AppCore,
     current: Option<OpenFile>,
     editor_text: String,
     tree: FileTree,
@@ -291,8 +188,6 @@ struct GuiApp {
     codex_log: Vec<LogLine>,
     title: String,
     sub_title: String,
-    running: Vec<RunningProcess>,
-    bug_log_path: PathBuf,
     codex_compact_view: bool,
     codex_sandbox_mode: CodexSandboxMode,
     codex_approval_policy: CodexApprovalPolicy,
@@ -310,8 +205,6 @@ struct GuiApp {
     codex_log_dirty: bool,
     last_codex_message: Option<String>,
     codex_assistant_buffer: String,
-    codex_install_attempted: bool,
-    pyinstaller_install_attempted: bool,
     pending_codex_prompt: Option<String>,
     codex_follow_output: bool,
     last_window_title: String,
@@ -323,10 +216,11 @@ impl GuiApp {
             Ok(path) => path,
             Err(_) => root_dir,
         };
-        let bug_log_path = root_dir.join("bug.md");
-        let tree = FileTree::new(&root_dir);
+        let core = AppCore::new(root_dir.clone());
+        let tree = FileTree::new(core.workspace());
         let mut app = Self {
             root_dir,
+            core,
             current: None,
             editor_text: String::new(),
             tree,
@@ -336,8 +230,6 @@ impl GuiApp {
             codex_log: Vec::new(),
             title: APP_NAME.to_string(),
             sub_title: String::new(),
-            running: Vec::new(),
-            bug_log_path,
             codex_compact_view: true,
             codex_sandbox_mode: codex_sandbox_mode_from_env(),
             codex_approval_policy: codex_approval_policy_from_env(),
@@ -355,13 +247,11 @@ impl GuiApp {
             codex_log_dirty: true,
             last_codex_message: None,
             codex_assistant_buffer: String::new(),
-            codex_install_attempted: false,
-            pyinstaller_install_attempted: false,
             pending_codex_prompt: None,
             codex_follow_output: true,
             last_window_title: String::new(),
         };
-        app.ensure_portable_dirs();
+        app.core.ensure_portable_dirs();
         app.refresh_title();
         app.log_ui(format!(
             "{APP_NAME}\nRoot: {}\nAstuce: lance la version TUI avec --ui tui si besoin.\n",
@@ -369,11 +259,11 @@ impl GuiApp {
         ));
         app.codex_log_ui(format!(
             "Sandbox Codex: {}",
-            Self::codex_sandbox_label(app.codex_sandbox_mode)
+            codex_sandbox_label(app.codex_sandbox_mode)
         ));
         app.codex_log_ui(format!(
             "Approbations Codex: {}",
-            Self::codex_approval_label(app.codex_approval_policy)
+            codex_approval_label(app.codex_approval_policy)
         ));
         app
     }
@@ -540,7 +430,7 @@ impl GuiApp {
         Self::panel_frame(ui).show(ui, |ui| {
             Self::section_title(ui, "Fichiers");
             ui.separator();
-            let entries = self.tree.visible.clone();
+            let entries = self.tree.data.visible().to_vec();
             let available_height = ui.available_height();
             ScrollArea::vertical()
                 .id_source("file_tree")
@@ -558,7 +448,7 @@ impl GuiApp {
                             let indent = entry.depth as f32 * 12.0;
                             ui.add_space(indent);
                             if entry.is_dir {
-                                let icon = if self.tree.expanded.contains(&entry.path) {
+                                let icon = if self.tree.data.is_expanded(&entry.path) {
                                     "v"
                                 } else {
                                     ">"
@@ -741,16 +631,14 @@ impl GuiApp {
             });
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                let sandbox_label = format!(
-                    "Sandbox: {}",
-                    Self::codex_sandbox_label(self.codex_sandbox_mode)
-                );
+                let sandbox_label =
+                    format!("Sandbox: {}", codex_sandbox_label(self.codex_sandbox_mode));
                 if ui.button(sandbox_label).clicked() {
                     self.action_toggle_codex_sandbox();
                 }
                 let approval_label = format!(
                     "Approvals: {}",
-                    Self::codex_approval_label(self.codex_approval_policy)
+                    codex_approval_label(self.codex_approval_policy)
                 );
                 if ui.button(approval_label).clicked() {
                     self.action_toggle_codex_approval();
@@ -983,126 +871,15 @@ impl GuiApp {
             LogKind::Error
         };
         self.push_log(target, msg.to_string(), kind);
-        self.record_issue(niveau, msg, contexte, None);
-    }
-
-    fn record_issue(&self, niveau: &str, message: &str, contexte: &str, details: Option<&str>) {
-        let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        let mut lines = vec![
-            format!("## {timestamp}"),
-            format!("- niveau: {niveau}"),
-            format!("- contexte: {contexte}"),
-            format!("- message: {message}"),
-        ];
-        if let Some(details) = details {
-            lines.push(format!("- details: {details}"));
-        }
-        lines.push(String::new());
-        let content = lines.join("\n");
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.bug_log_path)
-            .and_then(|mut file| std::io::Write::write_all(&mut file, content.as_bytes()));
-    }
-
-    fn ensure_portable_dirs(&self) {
-        for path in [
-            self.root_dir.join("cache").join("pip"),
-            self.root_dir.join("cache").join("pycache"),
-            self.root_dir.join("cache").join("npm"),
-            self.root_dir.join("tmp"),
-            self.root_dir.join("codex_home"),
-            self.root_dir.join(".usbide"),
-            self.root_dir.join(".usbide").join("codex"),
-            self.root_dir.join(".usbide").join("tools"),
-        ] {
-            let _ = std::fs::create_dir_all(path);
-        }
+        self.core.record_issue(niveau, msg, contexte, None);
     }
 
     fn portable_env(&self, mut env_map: HashMap<String, String>) -> HashMap<String, String> {
-        env_map.insert(
-            "PIP_CACHE_DIR".to_string(),
-            self.root_dir
-                .join("cache")
-                .join("pip")
-                .display()
-                .to_string(),
-        );
-        env_map.insert(
-            "PYTHONPYCACHEPREFIX".to_string(),
-            self.root_dir
-                .join("cache")
-                .join("pycache")
-                .display()
-                .to_string(),
-        );
-        env_map.insert(
-            "TEMP".to_string(),
-            self.root_dir.join("tmp").display().to_string(),
-        );
-        env_map.insert(
-            "TMP".to_string(),
-            self.root_dir.join("tmp").display().to_string(),
-        );
-        env_map.insert("PYTHONNOUSERSITE".to_string(), "1".to_string());
-        env_map.insert(
-            "CODEX_HOME".to_string(),
-            self.root_dir.join("codex_home").display().to_string(),
-        );
-        env_map.insert(
-            "NPM_CONFIG_CACHE".to_string(),
-            self.root_dir
-                .join("cache")
-                .join("npm")
-                .display()
-                .to_string(),
-        );
-        env_map.insert(
-            "NPM_CONFIG_UPDATE_NOTIFIER".to_string(),
-            "false".to_string(),
-        );
-        env_map
-    }
-
-    fn truthy(value: Option<&String>) -> bool {
-        value
-            .map(|v| v.trim().to_lowercase())
-            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
-    }
-
-    fn sanitize_codex_env(&self, env_map: &mut HashMap<String, String>) {
-        let allow_api_key = Self::truthy(std::env::var("USBIDE_CODEX_ALLOW_API_KEY").ok().as_ref());
-        let allow_custom_base = Self::truthy(
-            std::env::var("USBIDE_CODEX_ALLOW_CUSTOM_BASE")
-                .ok()
-                .as_ref(),
-        );
-
-        if !allow_api_key {
-            env_map.remove("OPENAI_API_KEY");
-            env_map.remove("CODEX_API_KEY");
-        }
-        if !allow_custom_base {
-            env_map.remove("OPENAI_BASE_URL");
-            env_map.remove("OPENAI_API_BASE");
-            env_map.remove("OPENAI_API_HOST");
-        }
+        self.core.portable_env(std::mem::take(&mut env_map))
     }
 
     fn codex_env(&self) -> HashMap<String, String> {
-        let mut env_map: HashMap<String, String> = std::env::vars().collect();
-        env_map
-            .entry("PYTHONUTF8".to_string())
-            .or_insert_with(|| "1".to_string());
-        env_map
-            .entry("PYTHONIOENCODING".to_string())
-            .or_insert_with(|| "utf-8".to_string());
-        env_map = self.portable_env(env_map);
-        self.sanitize_codex_env(&mut env_map);
-        codex_env(&self.root_dir, Some(&env_map))
+        self.core.codex_env()
     }
 
     fn ensure_node_available(
@@ -1110,49 +887,25 @@ impl GuiApp {
         env_map: &HashMap<String, String>,
         target: LogTarget,
     ) -> bool {
-        if node_executable(&self.root_dir, Some(env_map)).is_some() {
-            return true;
+        if let Some(message) = self.core.ensure_node_available_message(env_map) {
+            self.log_issue(&message, "erreur", "node", target);
+            return false;
         }
-        let expected = self.root_dir.join("tools").join("node");
-        self.log_issue(
-            &format!(
-                "Node portable introuvable. Place node dans {} (ex: node.exe). Fallback Node hote possible via USBIDE_CODEX_ALLOW_HOST_NODE=1.",
-                expected.display()
-            ),
-            "erreur",
-            "node",
-            target,
-        );
-        false
+        true
     }
 
     fn tools_env(&self) -> HashMap<String, String> {
-        let mut env_map: HashMap<String, String> = std::env::vars().collect();
-        env_map
-            .entry("PYTHONUTF8".to_string())
-            .or_insert_with(|| "1".to_string());
-        env_map
-            .entry("PYTHONIOENCODING".to_string())
-            .or_insert_with(|| "utf-8".to_string());
-        env_map = self.portable_env(env_map);
-        tools_env(&self.root_dir, Some(&env_map))
+        self.core.tools_env()
     }
 
     fn wheelhouse_path(&self) -> Option<PathBuf> {
-        let wheelhouse = self.root_dir.join("tools").join("wheels");
-        if wheelhouse.is_dir() {
-            Some(wheelhouse)
-        } else {
-            None
-        }
+        self.core.wheelhouse_path()
     }
 
     fn open_file(&mut self, path: PathBuf) {
-        if path.is_dir() {
-            return;
-        }
-        match is_probably_binary(&path, 2048) {
-            Ok(true) => {
+        let opened = match open_workspace_file(self.core.workspace(), path) {
+            Ok(opened) => opened,
+            Err(OpenWorkspaceFileError::Binary(path)) => {
                 self.log_issue(
                     &format!("Binaire/non texte ignore: {}", path.display()),
                     "avertissement",
@@ -1161,24 +914,27 @@ impl GuiApp {
                 );
                 return;
             }
-            Err(err) => {
+            Err(OpenWorkspaceFileError::Hidden(path)) => {
                 self.log_issue(
-                    &format!("Acces fichier impossible: {} ({err})", path.display()),
+                    &format!("Fichier interne masque: {}", path.display()),
+                    "avertissement",
+                    "ouverture_fichier",
+                    LogTarget::Main,
+                );
+                return;
+            }
+            Err(OpenWorkspaceFileError::Sensitive(path)) => {
+                self.log_issue(
+                    &format!("Fichier sensible protege: {}", path.display()),
                     "erreur",
                     "ouverture_fichier",
                     LogTarget::Main,
                 );
                 return;
             }
-            _ => {}
-        }
-
-        let encoding = detect_text_encoding(&path);
-        let text = match read_text_with_encoding(&path, &encoding) {
-            Ok(text) => text,
             Err(err) => {
                 self.log_issue(
-                    &format!("Erreur ouverture: {} ({err})", path.display()),
+                    &err.to_string(),
                     "erreur",
                     "ouverture_fichier",
                     LogTarget::Main,
@@ -1186,38 +942,13 @@ impl GuiApp {
                 return;
             }
         };
-        self.editor_text = text;
+        self.editor_text = opened.text;
         self.current = Some(OpenFile {
-            path,
-            encoding,
+            path: opened.path,
+            encoding: opened.encoding,
             dirty: false,
         });
         self.refresh_title();
-    }
-
-    fn write_with_encoding(&self, path: &Path, encoding: &str, content: &str) -> Result<bool> {
-        let encoding_lower = encoding.to_lowercase();
-        if encoding_lower == "utf-8" {
-            std::fs::write(path, content.as_bytes()).context("ecriture fichier")?;
-            return Ok(false);
-        }
-        if encoding_lower == "utf-8-sig" {
-            let mut data = vec![0xEF, 0xBB, 0xBF];
-            data.extend_from_slice(content.as_bytes());
-            std::fs::write(path, data).context("ecriture fichier")?;
-            return Ok(false);
-        }
-        if let Some(enc) = encoding_rs::Encoding::for_label(encoding_lower.as_bytes()) {
-            let (cow, _, had_errors) = enc.encode(content);
-            if had_errors {
-                std::fs::write(path, content.as_bytes()).context("ecriture fallback utf-8")?;
-                return Ok(true);
-            }
-            std::fs::write(path, cow.as_ref()).context("ecriture fichier")?;
-            return Ok(false);
-        }
-        std::fs::write(path, content.as_bytes()).context("ecriture fallback utf-8")?;
-        Ok(true)
     }
     fn action_save(&mut self) {
         let (path, encoding, dirty) = match self.current.as_ref() {
@@ -1241,7 +972,7 @@ impl GuiApp {
         }
 
         let content = self.editor_text.clone();
-        let result = self.write_with_encoding(&path, &encoding, &content);
+        let result = write_text_with_encoding(&path, &encoding, &content);
         match result {
             Ok(used_utf8_fallback) => {
                 if used_utf8_fallback {
@@ -1324,7 +1055,7 @@ impl GuiApp {
     }
 
     fn action_reload_tree(&mut self) {
-        self.tree = FileTree::new(&self.root_dir);
+        self.tree.reload(self.core.workspace());
         self.log_ui("arborescence rechargee".to_string());
     }
 
@@ -1340,18 +1071,18 @@ impl GuiApp {
     }
 
     fn action_toggle_codex_sandbox(&mut self) {
-        self.codex_sandbox_mode = Self::next_codex_sandbox_mode(self.codex_sandbox_mode);
+        self.codex_sandbox_mode = next_codex_sandbox_mode(self.codex_sandbox_mode);
         self.codex_log_ui(format!(
             "Sandbox Codex: {}",
-            Self::codex_sandbox_label(self.codex_sandbox_mode)
+            codex_sandbox_label(self.codex_sandbox_mode)
         ));
     }
 
     fn action_toggle_codex_approval(&mut self) {
-        self.codex_approval_policy = Self::next_codex_approval_policy(self.codex_approval_policy);
+        self.codex_approval_policy = next_codex_approval_policy(self.codex_approval_policy);
         self.codex_log_ui(format!(
             "Approbations Codex: {}",
-            Self::codex_approval_label(self.codex_approval_policy)
+            codex_approval_label(self.codex_approval_policy)
         ));
     }
 
@@ -1360,76 +1091,16 @@ impl GuiApp {
     }
 
     fn codex_exec_extra_args(&self) -> Vec<String> {
-        let mut args = Vec::new();
-        if self.codex_sandbox_supported != Some(false) {
-            args.push("--sandbox".to_string());
-            args.push(self.codex_sandbox_mode.as_str().to_string());
-        }
-        if self.codex_approval_supported != Some(false) {
-            args.push("--ask-for-approval".to_string());
-            args.push(self.codex_approval_policy.as_str().to_string());
-        }
-        args
-    }
-
-    fn codex_sandbox_label(mode: CodexSandboxMode) -> &'static str {
-        match mode {
-            CodexSandboxMode::ReadOnly => "lecture seule",
-            CodexSandboxMode::WorkspaceWrite => "agent (workspace)",
-            CodexSandboxMode::DangerFullAccess => "danger (acces complet)",
-        }
-    }
-
-    fn codex_approval_label(policy: CodexApprovalPolicy) -> &'static str {
-        match policy {
-            CodexApprovalPolicy::Untrusted => "non fiable",
-            CodexApprovalPolicy::OnFailure => "sur echec",
-            CodexApprovalPolicy::OnRequest => "sur demande",
-            CodexApprovalPolicy::Never => "jamais",
-        }
-    }
-
-    fn next_codex_sandbox_mode(mode: CodexSandboxMode) -> CodexSandboxMode {
-        match mode {
-            CodexSandboxMode::ReadOnly => CodexSandboxMode::WorkspaceWrite,
-            CodexSandboxMode::WorkspaceWrite => CodexSandboxMode::DangerFullAccess,
-            CodexSandboxMode::DangerFullAccess => CodexSandboxMode::ReadOnly,
-        }
-    }
-
-    fn next_codex_approval_policy(policy: CodexApprovalPolicy) -> CodexApprovalPolicy {
-        match policy {
-            CodexApprovalPolicy::OnRequest => CodexApprovalPolicy::OnFailure,
-            CodexApprovalPolicy::OnFailure => CodexApprovalPolicy::Untrusted,
-            CodexApprovalPolicy::Untrusted => CodexApprovalPolicy::Never,
-            CodexApprovalPolicy::Never => CodexApprovalPolicy::OnRequest,
-        }
-    }
-
-    fn approval_flag_error(line: &str) -> bool {
-        let lower = line.to_lowercase();
-        lower.contains("--ask-for-approval")
-            && (lower.contains("unexpected argument")
-                || lower.contains("unknown argument")
-                || lower.contains("unrecognized"))
-    }
-
-    fn sandbox_flag_error(line: &str) -> bool {
-        let lower = line.to_lowercase();
-        lower.contains("--sandbox")
-            && (lower.contains("unexpected argument")
-                || lower.contains("unknown argument")
-                || lower.contains("unrecognized"))
-    }
-
-    fn sandbox_value_error(line: &str) -> bool {
-        let lower = line.to_lowercase();
-        lower.contains("--sandbox")
-            && (lower.contains("invalid value") || lower.contains("possible values"))
+        codex_exec_extra_args(
+            self.codex_sandbox_supported,
+            self.codex_sandbox_mode,
+            self.codex_approval_supported,
+            self.codex_approval_policy,
+        )
     }
 
     fn handle_approval_flag_line(&mut self, line: &str) -> bool {
-        if !self.codex_exec_used_approval_flag || !Self::approval_flag_error(line) {
+        if !self.codex_exec_used_approval_flag || !crate::app_core::approval_flag_error(line) {
             return false;
         }
         if self.codex_approval_supported != Some(false) {
@@ -1446,7 +1117,7 @@ impl GuiApp {
         if !self.codex_exec_used_sandbox_flag {
             return false;
         }
-        if Self::sandbox_flag_error(line) || Self::sandbox_value_error(line) {
+        if crate::app_core::sandbox_flag_error(line) || crate::app_core::sandbox_value_error(line) {
             if self.codex_sandbox_supported != Some(false) {
                 self.codex_sandbox_supported = Some(false);
                 self.codex_log_action(
@@ -1653,10 +1324,10 @@ impl GuiApp {
         if !force && pyinstaller_available(Some(&self.root_dir), Some(&env_map)) {
             return true;
         }
-        if !force && self.pyinstaller_install_attempted {
+        if !force && self.core.pyinstaller_install_attempted {
             return false;
         }
-        self.pyinstaller_install_attempted = true;
+        self.core.pyinstaller_install_attempted = true;
         let prefix = tools_install_prefix(&self.root_dir);
         let _ = std::fs::create_dir_all(&prefix);
         let wheelhouse = self.wheelhouse_path();
@@ -1689,25 +1360,11 @@ impl GuiApp {
     }
 
     fn codex_device_auth_enabled(&self) -> bool {
-        std::env::var("USBIDE_CODEX_DEVICE_AUTH")
-            .map(|v| {
-                matches!(
-                    v.trim().to_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false)
+        self.core.codex_device_auth_enabled()
     }
 
     fn codex_auto_install_enabled(&self) -> bool {
-        std::env::var("USBIDE_CODEX_AUTO_INSTALL")
-            .map(|v| {
-                !matches!(
-                    v.trim().to_lowercase().as_str(),
-                    "0" | "false" | "no" | "off"
-                )
-            })
-            .unwrap_or(true)
+        self.core.codex_auto_install_enabled()
     }
 
     fn install_codex(&mut self, force: bool, target: LogTarget) -> bool {
@@ -1715,7 +1372,7 @@ impl GuiApp {
         if !force && codex_cli_available(Some(&self.root_dir), Some(&env_map)) {
             return true;
         }
-        if !force && self.codex_install_attempted {
+        if !force && self.core.codex_install_attempted {
             self.log_issue(
                 "Installation Codex deja tentee. (bouton Installer pour forcer)",
                 "avertissement",
@@ -1736,7 +1393,7 @@ impl GuiApp {
         if !self.ensure_node_available(&env_map, target) {
             return false;
         }
-        self.codex_install_attempted = true;
+        self.core.codex_install_attempted = true;
         let package = std::env::var("USBIDE_CODEX_NPM_PACKAGE")
             .unwrap_or_else(|_| "@openai/codex".to_string());
         let prefix = codex_install_prefix(&self.root_dir);
@@ -1876,9 +1533,9 @@ impl GuiApp {
         target: LogTarget,
         kind: ProcessKind,
     ) {
-        match stream_subprocess(&argv, Some(&self.root_dir), Some(&env_map)) {
+        match NativeProcessRunner.spawn(&argv, Some(&self.root_dir), Some(&env_map)) {
             Ok(handle) => {
-                self.running.push(RunningProcess {
+                self.core.running.push(RunningProcess {
                     handle,
                     kind,
                     target,
@@ -1897,7 +1554,7 @@ impl GuiApp {
     }
 
     fn drain_process_events(&mut self) {
-        let mut active = std::mem::take(&mut self.running);
+        let mut active = std::mem::take(&mut self.core.running);
         let mut remaining = Vec::new();
 
         for mut proc in active.drain(..) {
@@ -1942,9 +1599,9 @@ impl GuiApp {
             }
         }
 
-        let mut spawned = std::mem::take(&mut self.running);
+        let mut spawned = std::mem::take(&mut self.core.running);
         remaining.append(&mut spawned);
-        self.running = remaining;
+        self.core.running = remaining;
     }
     fn handle_process_line(&mut self, proc: &mut RunningProcess, line: &str) {
         match proc.kind {
